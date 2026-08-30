@@ -1,0 +1,23 @@
+# 行尾规范化：保证跨平台脚本不因 CRLF 失效
+* text=auto
+
+# Shell 脚本必须是 LF（CRLF 会导致 #!/usr/bin/env bash^M 报 bad interpreter）
+*.sh text eol=lf
+
+# Windows 批处理必须是 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 文档与源码统一 LF 入库
+*.md text
+*.py text
+*.mjs text
+*.txt text
+*.yml text
+*.yaml text
+*.json text
+
+# 二进制不参与转换
+*.png binary
+*.jpg binary
+*.ico binary

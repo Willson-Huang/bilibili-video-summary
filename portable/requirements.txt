@@ -1,0 +1,9 @@
+# 便携版核心依赖（见 ../SKILL.md 的安装说明）
+# 仅 bili_asr.py / process_queue.py 需要；bili.mjs 走 Node，不需要本文件
+faster-whisper>=1.0.0
+yt-dlp>=2024.1.0
+imageio-ffmpeg>=0.4.9
+
+# 可选：NVIDIA GPU 加速（按你的 CUDA 版本选装，不装会自动回退 CPU）
+# nvidia-cublas-cu12
+# nvidia-cudnn-cu12

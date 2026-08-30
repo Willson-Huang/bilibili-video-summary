@@ -1,0 +1,29 @@
+# ---- 凭据 / 密钥 ----
+.bilibili_cookie
+*.cookie
+.env
+.env.*
+*.token
+
+# ---- 运行产物（不入库）----
+bilibili_queue.csv
+raw/
+notes/
+transcripts/
+素材包/
+outputs/
+.workbuddy/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- Node ----
+node_modules/
+
+# ---- 系统 ----
+.DS_Store
+Thumbs.db
+*.log
