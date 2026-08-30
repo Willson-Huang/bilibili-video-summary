@@ -20,6 +20,18 @@ python tests/test_core.py             # 自测（不联网、无需额外依赖�
 
 **Requires / 环境要求**：Python 3.10+；Node ≥ 18（可选，仅 `bili.mjs` / `set-cookie.mjs` 需要）。
 
+## 📦 下载安装 / Download & Install
+
+不想用 git？直接从 [**Releases**](https://github.com/Willson-Huang/bilibili-video-summary/releases/latest) 下载打包好的安装包：
+
+| 资产 | 用途 |
+|---|---|
+| `bilibili-video-summary-workbuddy-vX.Y.Z.zip` | 解压后把 `bilibili-video-summary/` 整个放进 `~/.workbuddy/skills/`，重启 WorkBuddy 即完成安装 |
+| `bilibili-video-summary-portable-vX.Y.Z.zip` | 解压到任意位置，把 `SKILL.md` 作为指令导入 Claude Projects / Cursor Rules / Custom GPT |
+| `checksums.txt` | 各资产 SHA-256，下载后建议核对 |
+
+> WorkBuddy 版首次使用前需准备转写环境（`pip install faster-whisper yt-dlp imageio-ffmpeg`），详见 Release Notes。
+
 ---
 
 ## 两个版本 / Two editions
