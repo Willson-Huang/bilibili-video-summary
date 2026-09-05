@@ -197,6 +197,7 @@ def main():
     ap.add_argument('--cache-dir', default=str(DEFAULT_CACHE), help='素材包缓存目录')
     ap.add_argument('--meta-only', action='store_true')
     ap.add_argument('--limit', type=int, default=0)
+    ap.add_argument('--up', help='只处理指定 UP主（按 UP主 列精确匹配）')
     ap.add_argument('--model', default='large-v3-turbo')
     ap.add_argument('--finish', help='收尾模式：指定 BV号，回填纪要、状态置已完成、删除缓存素材包')
     ap.add_argument('--summary', help='纪要路径或链接，配合 --finish 使用')
@@ -287,6 +288,8 @@ def main():
             continue
         if st == ST_TRANSCRIBED and not a.meta_only:
             continue
+        if a.up and field_text(r, 'UP主').strip() != a.up:
+            continue
         targets.append((rid, link, st))
 
     if a.limit:
@@ -375,7 +378,8 @@ def main():
             props = {'BV号': {'text': bv}, 'UP主': {'text': meta['up']},
                      '视频标题': {'text': meta['title']}, '时长': {'text': meta['duration']},
                      '处理时间': {'date': today},
-                     '转写耗时(秒)': {'number': round(r.get('asr', {}).get('asr_sec', 0))},
+                     # 字幕路由下 asr 为 null（未跑 Whisper），必须容错，否则回填崩溃
+                     '转写耗时(秒)': {'number': round((r.get('asr') or {}).get('asr_sec', 0))},
                      '素材包': {'text': str(out_md)},
                      '状态': {'select': ST_TRANSCRIBED}}
             pubdate = extract_pubdate(out_md) or meta.get('pubdate', '') or today

@@ -181,6 +181,8 @@ bilibili-video-summary/
     ├── SKILL.md         # 完整指令——导入 AI 平台的就是它
     ├── requirements.txt
     ├── scripts/         # bili_asr.py / process_queue.py / bili.mjs / bili_wbi.py|mjs ...
+    │                    #   verify_structure.py 结构校验 · verify_coverage.py 覆盖校验
+    │                    #   chrome_cookie_export.py 自动导出 Chrome B站 Cookie（需 cryptography）
     ├── references/      # 知识条目模板 / 广告过滤词表
     └── tests/           # 纯本地自测（13 项断言）
 ```

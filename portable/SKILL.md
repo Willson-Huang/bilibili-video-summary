@@ -226,6 +226,19 @@ python scripts/process_queue.py --model large-v3
 - 原有小节的编号和顺序保持不变
 - 增强后文件体积应**大于**原文件（+50% 以上属正常），若变小说明发生了删减
 
+## 生成后必做：结构校验
+
+产物落盘后立即跑，不要等用户发现：
+
+```bash
+python scripts/verify_structure.py raw/<新生成的文件>.md
+python scripts/verify_structure.py --dir raw     # 全库体检
+```
+
+校验四项：frontmatter 齐全、tags 6–10 / entities 8–12、14 节齐全、内容要点已表格化。**任一项不通过就退回重写，不要带着结构缺陷交付。**
+
+与 `verify_coverage.py` 分工：本脚本查「结构对不对」，`verify_coverage.py <原> <新>` 查「增强时有没有遗失」。重写时两个都必须过。
+
 ## 覆盖校验
 
 **重写或增强已有条目后必须执行**，用脚本客观比对，不靠肉眼。初次生成不需要。
@@ -299,6 +312,8 @@ python scripts/bili_asr.py --batch-file <items.json> --model large-v3-turbo
 
 ## 注意事项
 - 大会员/付费视频需 Cookie 才能下载音轨：用 `node scripts/set-cookie.mjs --cookie "SESSDATA=...; ..."` 存到 `BILI_COOKIE`，或转写时传 `--cookie`。
+- Chrome 里已登录 B站的话，可尝试 `python scripts/chrome_cookie_export.py --dry-run` 自动导出（需 `pip install cryptography`；仅支持 Chrome v10/v11 加密，Chrome 127+ 的 v20 App-Bound 无法解密，此时回退 F12 手动复制 SESSDATA）。
+- Cookie 等同账号凭据：只存本地文件，**不要提交 git、不要贴进公开场合**；贴进对话时用完即弃。
 - 转写是口播内容，含口语重复与 ASR 错字；总结时归纳而非照抄，疑问处标注 `[原文疑似]`。
 - 评论仅作舆论参考，不作为观点依据。
 - 未配置 Cookie 时字幕路由恒定不可用（B站字幕接口返回空、AI 摘要接口返回 `-101`），直接走本地 ASR，不必反复尝试。

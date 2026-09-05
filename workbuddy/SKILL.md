@@ -77,6 +77,12 @@ bili.bat "<链接>" --model large-v3-turbo --out ".workbuddy/cache/bili/bili_<BV
 
 不区分"简单总结"和"存知识库"——用户存这些文件就是为了能搜到，精简版省下的那点篇幅，代价是半年后检索不到。用户明确要求极简摘要（如"三句话说完"）时，直接在回复里答，不落盘。
 
+**派发子代理前的两个硬动作**（漏一个就可能产出残次结构）：
+1. **读 `references/knowledge-entry-template.md` 原文**，或把「输出结构（14 节）」里的骨架原样抄进 prompt。**禁止凭记忆复述章节列表**——2026-09-02 就是因为凭记忆写 prompt，连续两批 46 份退回 6 节旧模板。
+2. 在 prompt 里写明：写完必须跑 `python scripts/verify_structure.py <产物路径>`，不通过就改到通过。
+
+**子代理返回后**：不要只看它的完成报告，跑一次结构校验确认——报告说"已完成"和实际合规是两回事。
+
 **命名规则（硬规则）**：`<发布日>_<完整标题>_<UP主>_纪要.md`
 - 发布日取视频发布日，不是处理日
 - 标题原文照抄，只剔除 Windows 非法字符 `\ / : * ? " < > |`；全角标点（，？【】）**保留**
@@ -91,7 +97,9 @@ bili.bat "<链接>" --model large-v3-turbo --out ".workbuddy/cache/bili/bili_<BV
 
 ## 输出结构（14 节）
 
-完整结构见 `references/knowledge-entry-template.md`，必须按序写全：
+完整结构见 `references/knowledge-entry-template.md`，必须按序写全。
+
+⚠️ **2026-09-02 事故**：连续两批（共 46 份）产物退回 6 节旧模板——派发时凭记忆写 prompt，没去读模板文件。教训：**派发子代理前，把下面的骨架原样抄进 prompt，不要凭印象重写。**
 
 | 节 | 内容 |
 |---|---|
@@ -111,7 +119,64 @@ bili.bat "<链接>" --model large-v3-turbo --out ".workbuddy/cache/bili/bili_<BV
 | 十三 | 相关链接 |
 | 十四 | 更新记录 |
 
+**可直接抄进 prompt 的骨架**（照抄，别自行精简）：
+
+```markdown
+---
+title: <可读标题，概括主张而非照抄视频标题>
+date: YYYY-MM-DD
+type: <播客访谈纪要/知识科普/评论解说/教程演示/圆桌对谈>
+source: <平台 + BV号>
+source_url: <链接>
+duration: <时长>
+speakers: <主讲人/嘉宾>
+confidence: 高/中/低（必填理由）
+tags: [6-10 个，领域词与具体词混合]
+entities: [8-12 个，人物/组织/产品/地名，写全名带别名]
+created: YYYY-MM-DD
+review_by: YYYY-MM
+status: 待复核
+---
+
+# <标题>
+> 元数据块：来源、时长、编号、转写方式、嘉宾/主讲人
+
+---
+## 一、这条知识能回答什么问题
+## 二、核心结论
+## 三、关键实体表
+### 3.1 人物—角色—关键信息
+### 3.2 产品—归属—状态
+### 3.3 模型/项目—参数—状态
+## 四、内容要点        # 能用表格就不用散文
+## 五、章节脉络
+## 六、反共识观点
+## 七、时间线
+## 八、关键决策与结论
+## 九、金句
+## 十、待验证清单      # 判断+依据+验证时点+验证方式
+## 十一、术语表
+## 十二、信息完整性    # 转写覆盖 + ASR误识对照表 + 证据强度问题
+## 十三、相关链接
+## 十四、更新记录
+```
+
 **tags / entities 决定半年后能不能搜到**，填写粒度见模板。写完全文再回头补这两项——只有通读完才知道这条真正讲的是什么。
+
+---
+
+## 生成后必做：结构校验
+
+产物落盘后立即跑，不要等用户发现：
+
+```bash
+python scripts/verify_structure.py raw/<新生成的文件>.md
+python scripts/verify_structure.py --dir raw     # 全库体检
+```
+
+校验四项：frontmatter 齐全、tags 6–10 / entities 8–12、14 节齐全、内容要点已表格化。**任一项不通过就退回重写，不要带着结构缺陷交付。**
+
+与 `verify_coverage.py` 分工：本脚本查「结构对不对」，`verify_coverage.py <原> <新>` 查「增强时有没有遗失」。重写时两个都必须过。
 
 ---
 
@@ -154,6 +219,7 @@ PYTHONPATH= ~/.workbuddy/binaries/python/envs/whisper/Scripts/python.exe \
 | `--token` | 资料库凭证，由 `connect_open_platform` 取得，**有效期 30 分钟**，过期重取 |
 | `--meta-only` | 只查重 + 补元信息，不转写（几秒一批） |
 | `--limit N` | 本次最多处理 N 条 |
+| `--up <UP主>` | 只处理指定 UP主（按「UP主」列精确匹配），适合按系列分批 |
 | `--raw-dir` | **纪要**落盘目录，默认 `<RAW_DIR>` |
 | `--cache-dir` | **素材包**缓存目录，默认 `<CACHE_DIR>` |
 | `--note-name <BV号>` | 只输出该 BV 的标准纪要文件名，不碰台账 |
@@ -239,15 +305,26 @@ PYTHONPATH= ~/.workbuddy/binaries/python/envs/whisper/Scripts/python.exe \
 
 **注意**：广告段落仍保留在素材包正文里（带标记），保证生成阶段可追溯；过滤只作用于纪要生成阶段。素材包删掉后，可追溯性由纪要「信息完整性」章节里的「广告段落处理」条目承担。
 
+**纪实/产业类系列（如「快递里的中国」）复核原则**：这类 UP主 正文大量提及品牌、产品、产业（拼多多、麦当劳、当地特产等），命中弱信号词属正常。AI 生成纪要时必须逐段复核上下文——叙述城市产业/事件/特产 → 属于节目内容，**保留**并写入纪要；只有 UP主 本人的带货口播（念链接、优惠券、感谢金主、推荐购买）才剔除。已实测：老猫鱼 24 条全量处理中，所有 `[广告?]` 标记段落经复核均正确区分（产业叙述保留、真口播剔除），无大段误删。
+
 ## 产物去向
 
-**只留纪要，不留素材包。**
+**纪要长期保留；素材包归档，不再删除。**
 
 | 产物 | 去向 | 生命周期 |
 |---|---|---|
-| 素材包（转写全文 `bili_<BV>.md`） | `.workbuddy/cache/bili/` | 中间产物，`--finish` 收尾时删除 |
+| 素材包（转写全文 `bili_<BV>.md`） | `.workbuddy/cache/bili_subs/` | **归档保留**（2026-09-02 起） |
 | 纪要 / 知识条目 | `<RAW_DIR>` | 长期保留，命名见第 5 步硬规则 |
-| 纪要副本 | IMA「B站视频转录」kb_id `<YOUR_IMA_KB_ID>` | 上传一次即归档 |
+| 纪要副本 | IMA「B站视频转录」kb_id `<YOUR_IMA_KB_ID>` | 上传一次即归档；内容变更时用 REPLACE 覆盖 |
+
+**为什么素材包改为保留**（这条踩过两次）：
+- 2026-09-01 修 ASR 误识时，发现 32 条素材包已被 `--finish` 删除，只能靠字幕重跑一遍——当时登录态还没配，等于重做转写。
+- 素材包是**误识修正的唯一依据**（要拿字幕原文逐处对照，不是凭上下文猜）。删掉就等于放弃修正能力。
+- 体积代价可忽略：单份 20–150 KB，100 份约 10 MB。
+
+归档操作：收尾时用 `shutil.move` 把 `cache/bili/bili_<BV>.md` 挪到 `cache/bili_subs/`，并把 index.json 的 `transcript` 指向新路径。**不要用 `--finish` 的默认删除行为。**
+
+⚠️ 归档目录里存在**两种前缀**：`sub_BV*.md`（2026-09-01 批次，18 份）和 `bili_BV*.md`（后续批次）。统计数量时只 glob 一种会漏掉另一批。
 
 IMA 通道不可用时**降级**：只落本地，把 IMA转存 保持「未转存」并在回复中说明「IMA 未连接，本次仅本地归档」，核心流程不中断。上传成功后把该行 IMA转存 改为「已转存」；失败改「失败」并在备注写原因。**只有看到「已转存」才算归档完成**，不要凭推测标注。
 
@@ -291,6 +368,16 @@ PYTHONPATH= ~/.workbuddy/binaries/python/versions/3.13.12/python.exe \
 - 报 `InvalidAccessKeyId` = 凭证抄错。**不要手抄长 token**：把 `create_media` 整个返回原样写进临时文件再喂脚本，抄错一位就 403；用完立即删（含密钥）。
 - 只传 `cos_credential` 子节点会丢 `media_id`，脚本先取顶层 `media_id` 再下钻。
 - 上传的 `file_name` 用与本地一致的标准名，IMA 里才能对得上。
+- **工具「已连接」≠ 可用**：桌面面板显示已连接、`connector-status` 显示 connected，都不代表工具暴露给 agent。唯一判定标准是 `ToolSearch` 搜 `mcp__ima-mcp__create_media` 能否搜到。搜不到就是没暴露，别反复重试，直接降级本地归档。
+- **当前会话内启用连接器不会刷新工具索引**（2026-09-04 实测）：会话启动时 IMA 未启用 → 索引快照里没有 `mcp__ima-mcp__*`；会话中途在面板启用后，`connector-status` 会变成 connected、`connector-states.json` 里 `enabled: true` 也确实写入了，但 **deferred tools 索引不刷新**，`ToolSearch` 依旧搜不到、直接 `DeferExecuteTool` 调用报 `not found in the deferred tools index`。此时改配置文件无济于事，**唯一解法是开一个新会话**（新会话启动时索引会重新加载 IMA 工具）。所以批量上传前应先确认工具可用，而不是假定「用户说连好了就能用」。
+- **覆盖上传的验证标准与首次上传不同**：首次上传看 `knowledge_total_size` 传 N 条应 +N；**覆盖同名条目时条目数不变**，需改看单条 size 字节数变化或抽查条目内容确认已更新。
+- **`create_media` 偶发返回空**：`{"media_id":"","cos_credential":null}`，不是参数错误，原样重试第二次必成。别改参数瞎试。
+- **media_id 抄错不报错**：长十六进制串手写进 batch JSON 时多/少一位，COS 推流照样 200，直到 `add_knowledge` 才指向错误对象，且此时已无法察觉。校验判据用「**以知识库 id `<YOUR_IMA_KB_ID>` 结尾 + 长度 ≥80**」；~~全长 84 字符~~的说法是错的，**实测全长 90**（`markdown_` 9 + 32hex + `_` 1 + 32hex + kb_id 16），按 84 校验会把所有合法 id 判为非法。
+- **批量覆盖用「索引配对」，别手工拼 batch JSON**（2026-09-04 实测 63 份）：先把待传清单按固定顺序落成 `ima_rows.json`（含 name/size/path），`create_media` 的返回按同一顺序写成 `ima_cred_<n>.json`，再用脚本按索引号配对拼 batch。这样 media_id 与本地文件不可能串位——手工拼时一旦错位，推流照样 200，只能等 add_knowledge 才发现，且已无法挽回。
+- **覆盖的并行节奏**：`create_media ×8` → 写 8 个凭证 → `--batch` 推流 → `add_knowledge ×8`；推流命令与下一批的 `create_media ×8` 同一轮发出，流水作业。63 份实测约 21 分钟。
+- **凭证用完立即删**：`ima_cred_*.json` 含 `secret_key`。63 份清完一次性 `rm -f`，Windows 下 `rm` 一次删 60+ 个文件可能被 SIGTERM 打断，**分 5 批每批 ≤16 个**稳妥。
+- **批量节奏（32 条实测）**：`create_media` 逐条取凭证攒够 8 条 → 写进一个 JSON 数组跑 `--batch` → `add_knowledge` 逐条入库。凭证有效期 12 小时（`expired_time - start_time = 43200`），攒批不超时。
+- **校验闭环**：`get_knowledge_base_list` 看 `knowledge_total_size` 增量，传 N 条应正好 +N。这是唯一可信的完成证据，不要用「调用没报错」当证据。
 - IMA 没有删除接口，传之前先确认文件对不对。
 
 ## 只增不减（硬规则）
@@ -378,6 +465,76 @@ yt-dlp 直接落 B站原生 m4a(AAC)，PyAV 可直接解码，省掉 ffmpeg 转�
 - large-v3 正确、turbo 错：生态位、姓魏的商人、小浣熊、沈殿霞
 - **两者共同短板**：人名、品牌名、金额数字（"安藤百福"→"安等/安登百福"；"一角五分"→"一脚五分/195分"）
 - 结论：**默认 turbo**。术语密集或需逐字引用时才用 large-v3；数字与专名在产出中一律标注 `[原文疑似]`，并在「信息完整性」列出误识对照表。
+
+## 断点恢复：对话中断后如何核实真实进度
+
+长任务（30+ 条）常因对话中断、token 过期或上下文丢失而断在半路。**中断后不要凭记忆回答，也不要采信 subagent 的进度汇报**——实测有 subagent 谎报「16/16 完成」，查盘后实际一条都没回填。
+
+三步交叉核实，三处一致才算真完成：
+
+| 步骤 | 查什么 | 说明 |
+|---|---|---|
+| 1 | `.workbuddy/cache/bili/index.json` | 条目数；目标 BV 是否入库 |
+| 2 | `raw/` 目录按 mtime 排序 | 纪要实际落盘时间与数量，是本轮最硬的证据 |
+| 3 | 台账三列交叉 | `状态`=已完成 + `纪要`列非空 + `IMA转存` 状态，三者同时对得上 |
+
+判读规则：
+- index.json 有 BV、raw 有纪要、台账状态=已完成 → 该条闭环，只差 IMA
+- index.json 有 BV 但 raw 无纪要 → 转写完成、纪要待生成
+- 判读规则里不再用「transcript 为空」判断是否跑完收尾——2026-09-02 起素材包是归档保留的，`transcript` 会指向 `cache/bili_subs/` 下的路径。判断进度改用 `raw/` 的 mtime + 台账状态。
+- 台账 `状态`=已转写但 raw 无纪要 → 待生成纪要
+- 台账 `纪要`列有值但 raw 文件不存在 → 文件被误删或挪走，需排查
+
+**踩过的坑**
+- **Git Bash 的 `/tmp` 对 Windows Python 不可见**（Python 会解析成 `\tmp\` 报 FileNotFoundError）。临时脚本一律写 Windows 路径 `%TEMP%\`，用完删除。
+- **token 30 分钟过期**：30+ 条的任务不要指望一个 token 跑满，分批处理，每批重取凭证。
+- **subagent 进度汇报一律以落盘文件为准复核**，汇报「完成」不等于台账已回填。
+
+## 登录态配置（Cookie 持久化）
+
+**不用每次传 `--cookie`，写一次文件即永久生效。**
+
+| 项 | 值 |
+|---|---|
+| 配置文件 | `~/.workbuddy/.bilibili_cookie`（`bili_asr.py` 的 `COOKIE_FILE`） |
+| 格式 | 单行 `k=v; k=v; k=v`，如 `SESSDATA=xxx; bili_jct=xxx; DedeUserID=xxx` |
+| 必需字段 | **只有 `SESSDATA`** —— 登录判定是 `'SESSDATA=' in COOKIE_HEADER.upper()`，其余可选 |
+| 优先级 | `--cookie` 参数 > 该文件 > 纯匿名（自动补 `buvid3`） |
+
+**只能手动复制，别再试自动化（2026-09-01 实测三条路全断）**
+
+| 路径 | 结果 | 原因 |
+|---|---|---|
+| 读 Chrome Cookie 库 + DPAPI 解密 | ✗ | Chrome 127+ 用 **v20（App-Bound Encryption）**：主密钥能用 DPAPI 解出，但每条 value 须经 Chrome 自身服务再解一次，第三方拿不到。实测 34 条 bilibili cookie 全为 v20 |
+| `--remote-debugging-port=9222` + CDP | ✗ | 沙箱网络隔离，`netstat` 查不到 9222 监听 |
+| Console 执行 `document.cookie` | ✗ | **SESSDATA 的 `is_httponly=1`**，JS 读不到（同批的 bili_jct / DedeUserID 是 0，所以能读到的恰恰不含 SESSDATA） |
+
+附：Chrome 运行时 Cookie 库被独占锁（`WinError 32`），须先关闭 Chrome 才能复制读取。`scripts/chrome_cookie_export.py` 已实现 v10/v11 解密与 v20 识别，将来 Chrome 若回退加密方式可直接复用。
+
+**手动步骤（只要 SESSDATA 一个值）**
+1. Chrome 打开 `www.bilibili.com`，确认已登录（能看到头像）
+2. 按 `F12`
+3. 点标签栏最右的 `>>` → 选 **Application**（应用）
+4. 左侧 **Storage → Cookies** → 展开点 `https://www.bilibili.com`
+5. 右侧 **Filter 框输入 `SESSDATA`**（省去滚动翻找）
+6. 双击该行 **Value** 列 → 全选变蓝 → `Ctrl+C`
+
+拿到后写进 `~/.workbuddy/.bilibili_cookie`，内容就一行：`SESSDATA=粘贴的内容`。
+
+备选（Application 找不到时）：F12 → **Network** → 刷新页面 → 点第一个请求 → Headers → Request Headers → `cookie:` 整串复制（含 HttpOnly 字段）。
+
+**配了能拿到什么**
+- **字幕直取路由开放**：视频开了 CC/AI 字幕时秒级出全文，跳过 Whisper（批量场景从分钟级/条 降到 秒级/条）
+- 大会员 / 付费视频可下载音轨
+- 高码率音源，ASR 准确率略升
+
+**局限（别抱过高期望）**
+- 字幕直取的前提是**该视频 UP 主开放了字幕**，没开的照样走本地 ASR。纪实类 UP 主开字幕比例不高，配了 Cookie 也可能仍走 ASR 路由——这是正常的，不是配置失败。
+- `SESSDATA` 有效期约 1 个月；改密码、退出登录会立即失效，届时需重新配。
+
+**安全**：Cookie 等同账号凭据。该文件在用户 home 下，**不要提交 git、不要贴进公开场合**。用户把 Cookie 贴进对话时，用完即弃，不写入 memory 或任何日志。
+
+**验证是否生效**：跑一个已知有字幕的视频，看返回 JSON 的 `route` 字段是否变为 `subtitle:xxx`；素材包若出现「未配置登录凭据」说明没读到。
 
 ## 注意事项
 - 大会员/付费视频需 Cookie 才能下载音轨。
