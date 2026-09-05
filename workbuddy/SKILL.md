@@ -1,7 +1,7 @@
 ---
 name: bilibili-video-summary
 description: 用户发送 B站（bilibili）视频链接、BV号、av号或 b23.tv 短链，要求总结视频观点/要点/内容，或要求把视频内容整理成知识库条目时使用。通过本地 Whisper 模型下载音频并离线转写（GPU 加速），再基于转写全文生成 14 节知识库条目（含 YAML 元数据、检索入口表、实体表、时间线、待验证清单、术语表）。触发词：B站、bilibili、BV号、b23.tv、这个视频讲了什么、总结视频、视频要点、存知识库、知识库条目、归档。
-version: 2.1.0
+version: 2.2.0
 agent_created: true
 ---
 

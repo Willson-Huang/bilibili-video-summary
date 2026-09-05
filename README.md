@@ -128,6 +128,17 @@ python tests/test_core.py
 | `bilibili-video-summary-portable-vX.Y.Z.zip` | 解压到任意位置，把 `SKILL.md` 作为指令导入你的 AI 平台 |
 | `checksums.txt` | 各资产 SHA-256，下载后建议核对 |
 
+## 🆕 v2.2.0 更新（2026-09-05）
+
+- ✅ **结构校验**：新增 `verify_structure.py`——frontmatter 齐全、tags/entities 数量、14 节齐全、要点表格化，四项硬拦截（源于产物退回旧模板的生产事故）
+- 🍪 **Cookie 自动导出**：新增 `chrome_cookie_export.py`——直接解密 Chrome 存储的 B站 Cookie 写入凭据文件（支持 v10/v11 加密；Chrome 127+ 的 v20 会识别并提示手动配置）
+- 🎯 **按 UP主 过滤**：`library_queue.py --up <UP主>`，在线表队列按系列分批处理
+- 🐛 修复：字幕直取路由下 `asr` 为 `null` 时台账回填崩溃
+- 🗄️ **素材包归档制**：转写全文不再随收尾删除（归档至 `cache/bili_subs/`），ASR 误识修正随时可回查
+- 📖 新增完整文档：断点恢复三步核实法、Cookie 持久化配置、IMA 归档踩坑清单
+
+完整变更见 [Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.2.0)。
+
 ## ❓ FAQ
 
 <details>
