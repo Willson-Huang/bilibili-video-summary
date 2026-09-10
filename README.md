@@ -31,9 +31,19 @@
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
-| **v2.5.1** | 2026-09-10 | 双引擎路由（whisper ↔ Fun-ASR-Nano）· 专名纠错表 · 白名单自学习 |
+| **v2.5.2** | 2026-09-10 | 文档修正：AI 字幕经回译、专名不可信（含路由与验证基准的使用边界） |
+| [v2.5.1](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.5.1) | 2026-09-10 | 双引擎路由（whisper ↔ Fun-ASR-Nano）· 专名纠错表 · 白名单自学习 |
 | [v2.2.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.2.0) | 2026-09-05 | 结构校验 · Cookie 自动导出 · 队列按 UP主 过滤 · 合规加固 |
 | [v2.1.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.1.0) | 2026-08-30 | 首次发布：WorkBuddy 原版 + 跨平台便携版 |
+
+### v2.5.2 — 2026-09-10　[Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.5.2)
+
+- ⚠️ **修正一处会误导使用的表述**：此前文档把"有 B站官方字幕"写成「零识别错误，永远优先」——**这只对人工 CC 字幕成立**
+- 🔍 **明确字幕来源分级**（素材包「字幕」行会标注，`--force-asr` 可强制跳过字幕走本地转写）：
+  - `zh-CN` **人工 CC**（UP主 / 字幕组上传）→ 可信，可直接用，**可作本地转写的核对基准**
+  - `ai-zh` **B站 AI 生成** → **经中文 → 英文 → 中文回译**，地名 / 人名 / 机构名偏差可能很大（同音替代 + 回译错译），**不可作验证基准**
+- 🧭 **路由与验证的使用边界**：专名密集内容（历史 / 地理 / 政经）即使有 AI 字幕，也建议 `--force-asr --engine funasr-nano` 走本地转写；用"字幕对照"验证引擎时，基准必须用人工 CC 字幕，只有 AI 字幕时结论需再用常识复核
+- 📝 同步修正：README 流程图说明、FAQ、两版 SKILL.md 的路由逻辑与引擎分流表
 
 ### v2.5.1 — 2026-09-10　[Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.5.1)
 
@@ -111,7 +121,7 @@ graph LR
 
 | 环节 | 说明 |
 |---|---|
-| **字幕直取** | 配置 B站 Cookie 后直接拉取官方 CC/AI 字幕（秒级）；无字幕或未配置 Cookie 时自动降级为本地转写。音轨下载后不转码、转写完即删 |
+| **字幕直取** | 配置 B站 Cookie 后直接拉取字幕（秒级）；无字幕或未配置 Cookie 时自动降级为本地转写。音轨下载后不转码、转写完即删。⚠️ **"有字幕"不等于可信**：`zh-CN` = 人工 CC（可信，可作核对基准）；`ai-zh` = B站 AI 生成，**经中文 → 英文 → 中文回译**，地名人名偏差大，**不可作验证基准**——专名密集内容建议 `--force-asr` 走本地 `funasr-nano` |
 | **引擎路由** | 无字幕时按 `UP主白名单 → 视频 tag → 关键词打分` 选引擎（`--only-meta --classify` 给出建议）：`whisper` 快约 20 倍，`Fun-ASR-Nano` 中文专名更准（实测 10/11 vs 2/11）；灰区一律判 whisper |
 | **纠错与校验** | `asr_glossary.txt` 强制纠正"看起来没毛病的合法中文词"类误识；产出必须过 `verify_structure.py` 四项硬拦截（frontmatter / tags·entities 数量 / 14 节齐全 / 要点表格化）|
 
@@ -201,6 +211,22 @@ python tests/test_core.py
 <summary>需要 B站账号 / Cookie 吗？</summary>
 
 不需要。不配 Cookie 也能下载音轨并转写；配置 Cookie（`SESSDATA`）后可解锁 CC/AI 字幕直取（秒级，不用转写）。
+
+</details>
+
+<details>
+<summary>视频有 B站 AI 字幕，是不是就不用本地转写了？</summary>
+
+**看字幕来源，别看"有没有字幕"。**
+
+| 来源标识 | 是什么 | 能不能直接用 |
+|---|---|---|
+| `zh-CN` | 人工 CC（UP主 / 字幕组上传） | ✅ 可信，直接用，还能当本地转写的核对基准 |
+| `ai-zh` | B站 AI 生成 | ⚠️ **慎用** |
+
+`ai-zh` 是机器生成，且**经中文 → 英文 → 中文回译**：同一段口播先被识别/转成英文、再译回中文，地名、人名、机构名会成片偏移（同音替代叠加回译错译）。这类字幕拿来做"大概了解内容"没问题，**但不能作为专名的依据，也不能作为评估其他引擎的基准**。
+
+**做法**：专名密集的内容（历史 / 地理 / 政经），即使有 AI 字幕，也建议 `--force-asr --engine funasr-nano` 强制走本地转写；泛科技、口语向内容用 AI 字幕省时间是合理的。素材包的「字幕」行会标注来源，AI 字幕会带「（AI 生成，可能有错字）」提示。
 
 </details>
 
