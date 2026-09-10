@@ -13,9 +13,64 @@
 
 **EN** — Turn a Bilibili video into a knowledge note you can still search six months later: local Whisper transcription (offline, GPU-accelerated) plus a fixed 14-section Markdown template with timestamps, entity tables and a claims-to-verify list.
 
-[Releases](https://github.com/Willson-Huang/bilibili-video-summary/releases/latest) · [真实输出示例](examples/2025-07-25_哲学知识分享——熵增与熵减_荣格不吃炸鸡_纪要.md) · [快速开始](#-快速开始三选一) · [FAQ](#-faq)
+[Releases](https://github.com/Willson-Huang/bilibili-video-summary/releases/latest) · [更新日志](#-更新日志最新在上) · [真实输出示例](examples/2025-07-25_哲学知识分享——熵增与熵减_荣格不吃炸鸡_纪要.md) · [快速开始](#-快速开始三选一) · [FAQ](#-faq)
 
 </div>
+
+---
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     维护规则（改动本区块前必读）
+     1. 新版本一律插入本区块**最上方**，最新在前（不要追加到页面末尾）
+     2. 历史条目**只增不删**：不删除、不改写、不合并旧版本条目
+     3. 每个版本固定三段：版本号+日期（标题）→ 索引表加一行 → 条目明细
+     4. 仅"最新版本"展开；更早版本收进 <details>，保证首屏清爽且历史可查
+     ══════════════════════════════════════════════════════════════════════ -->
+
+## 🆕 更新日志（最新在上）
+
+| 版本 | 日期 | 主题 |
+|---|---|---|
+| **v2.5.1** | 2026-09-10 | 双引擎路由（whisper ↔ Fun-ASR-Nano）· 专名纠错表 · 白名单自学习 |
+| [v2.2.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.2.0) | 2026-09-05 | 结构校验 · Cookie 自动导出 · 队列按 UP主 过滤 · 合规加固 |
+| [v2.1.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.1.0) | 2026-08-30 | 首次发布：WorkBuddy 原版 + 跨平台便携版 |
+
+### v2.5.1 — 2026-09-10　[Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.5.1)
+
+- 🧠 **双引擎路由**：新增 **Fun-ASR-Nano** 支持，专治中文专名同音误识——实测专名正确率 **10/11 vs whisper 2/11**（"隐性债务"whisper 错成"险性债务"×5，Nano 全对）。`--classify` 按 UP主白名单 → 视频 tag → 关键词打分给出引擎建议
+- 📕 **专名纠错表**：新增 `references/asr_glossary.txt`（机器可读的 `误识 | 正确 | 语境限定`）+ `check_glossary.py` 兜底复核，拦截"看起来没毛病的合法中文词"类误识
+- 🔁 **自学习白名单**：`references/engine_up_whitelist.txt` + `engine_verify_log.txt`——UP主 → 引擎的映射可增量维护，判错留痕可追溯（本仓库只提供**模板**与维护规则，不含个人观看清单）
+- 🔧 **队列透传**：`process_queue.py --engine funasr-nano --hotwords <文件>`，批量队列不再悄悄跑回 whisper
+- 🐛 修复：`requested_downloads` 为空列表时索引崩溃；批量队列不再清空用户手写备注
+- 🧩 重构：WBI 签名逻辑统一到 `bili_wbi.py`；路径全部改为 `__file__` / 环境变量派生（可迁移、可便携部署）
+- ⚖️ **合规**：撤下第三方"B站非公开接口文档"映射表（该上游因**律师函**已关停并明令禁止再分发），改为只依赖公开 tag 接口
+
+<details>
+<summary><b>v2.2.0 — 2026-09-05</b>　结构校验 · Cookie 自动导出 · 队列按 UP主 过滤（点击展开）</summary>
+
+- ✅ **结构校验**：新增 `verify_structure.py`——frontmatter 齐全、tags/entities 数量、14 节齐全、要点表格化，四项硬拦截（源于产物退回旧模板的生产事故）
+- 🍪 **Cookie 自动导出**：新增 `chrome_cookie_export.py`——解密 Chrome 存储的 B站 Cookie 写入凭据文件（支持 v10/v11 加密；Chrome 127+ 的 v20 会识别并提示手动配置）
+- 🎯 **按 UP主 过滤**：`library_queue.py --up <UP主>`，在线表队列按系列分批处理
+- 🐛 修复：字幕直取路由下 `asr` 为 `null` 时台账回填崩溃
+- 🗄️ **素材包归档制**：转写全文不再随收尾删除（归档至 `cache/bili_subs/`，注意存在 `sub_BV*` / `bili_BV*` 两种前缀），ASR 误识修正随时可回查
+- 📖 新增完整文档：断点恢复三步交叉核实法、Cookie 持久化配置、IMA 归档踩坑清单（20+ 条）
+- 📝 README 全面重做：真实性能数据、Mermaid 流水线图、三路快速开始、真实输出示例、FAQ
+- ⚖️ 合规加固：输出示例与模板新增版权声明、24h 删除通道、付费内容使用限制
+
+</details>
+
+<details>
+<summary><b>v2.1.0 — 2026-08-30</b>　首次发布（点击展开）</summary>
+
+- 🚀 **双版本首发**：`workbuddy/`（drop-in 安装，含资料库在线表队列 + IMA 归档）+ `portable/`（无平台依赖，可装到 Claude / Cursor / 自定义 GPT）
+- 🎧 本地 Whisper 离线转写：faster-whisper + yt-dlp，GPU 加速；音轨不转码，转写完即删
+- 🧱 固定 14 节知识库条目模板 + 广告口播两级过滤（70 词表预标记 + AI 复核）
+- 🧩 公共 WBI 签名模块 `bili_wbi.py` / `bili_wbi.mjs`（消除三处重复实现）
+- 🧪 `tests/test_core.py` 纯本地自测（13 项断言，覆盖链接解析 / 段落合并 / 广告撞车词 / 时长解析）
+- ➕ `requirements.txt` 依赖声明、`.gitattributes` 行尾规范（`*.sh` 强制 LF）
+- 🔒 发布前隐私脱敏：本机路径参数化、私有资源 ID 占位化、真实视频数据中性化
+
+</details>
 
 ---
 
@@ -129,17 +184,6 @@ python tests/test_core.py
 | `bilibili-video-summary-workbuddy-vX.Y.Z.zip` | 解压后把 `bilibili-video-summary/` 整个放进 `~/.workbuddy/skills/`，重启 WorkBuddy 即完成安装 |
 | `bilibili-video-summary-portable-vX.Y.Z.zip` | 解压到任意位置，把 `SKILL.md` 作为指令导入你的 AI 平台 |
 | `checksums.txt` | 各资产 SHA-256，下载后建议核对 |
-
-## 🆕 v2.5.1 更新（2026-09-10）
-
-- 🧠 **双引擎路由**：新增 **Fun-ASR-Nano** 支持，专治中文专名同音误识——实测专名正确率 **10/11 vs whisper 2/11**（"隐性债务"whisper 错成"险性债务"×5，Nano 全对）。`--classify` 按 UP主白名单 → 视频 tag → 关键词打分给出引擎建议
-- 📕 **专名纠错表**：新增 `references/asr_glossary.txt`（机器可读的 `误识 | 正确 | 语境限定`）+ `check_glossary.py` 兜底复核，拦截"看起来没毛病的合法中文词"类误识
-- 🔁 **自学习白名单**：`references/engine_up_whitelist.txt` + `engine_verify_log.txt`——UP主 → 引擎的映射可增量维护，判错留痕可追溯（本仓库只提供**模板**与维护规则，不含个人观看清单）
-- 🐛 修复：`requested_downloads` 为空列表时索引崩溃；批量队列不再清空用户手写备注
-- 🧩 重构：WBI 签名逻辑统一到 `bili_wbi.py`，路径全部改为 `__file__` / 环境变量派生（可迁移、可便携部署）
-- ⚖️ **合规**：撤下第三方"B站非公开接口文档"映射表（该上游因**律师函**已关停），改为只依赖公开 tag 接口
-
-完整变更见 [Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.5.1)。历史版本见 v2.2.0 / v2.1.0。
 
 ## ❓ FAQ
 
