@@ -8,21 +8,160 @@ B站视频 → 本地 Whisper 转写 → 结构化素材包
                      [--hf-mirror] [--lang zh]
 依赖: faster-whisper, yt-dlp, imageio-ffmpeg
 """
-import argparse, hashlib, json, os, re, shutil, subprocess, sys, time, urllib.parse, urllib.request
+import argparse, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time, urllib.parse, urllib.request
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
 
-# WBI 签名 / HTTP 公共能力抽到 bili_wbi.py，与 search_bili.py 共用，
-# 避免 B站调整接口时要在多处同步修改
+# WBI 签名 / HTTP 公共能力抽到 bili_wbi.py，与 search_bili.py 共用
 from bili_wbi import UA, http_json, wbi_url
 HOME = Path.home()
-# 便携版：缓存与凭据统一放在用户级缓存目录，不再依赖 WorkBuddy 的 .workbuddy 夹
+# 便携版：缓存与凭据统一放用户级缓存目录，不依赖任何平台私有目录
 CACHE = Path(os.environ.get('BILI_CACHE', str(HOME / '.cache' / 'bilibili-video-summary')))
-MODEL_DIR = CACHE / 'models' / 'whisper'
+MODEL_DIR = Path(os.environ.get('BILI_MODEL_DIR', str(CACHE / 'models' / 'whisper')))
 AUDIO_DIR = Path(os.environ.get('BILI_TMP', str(CACHE / 'tmp' / 'bili_audio')))
 COOKIE_FILE = Path(os.environ.get('BILI_COOKIE', str(CACHE / '.bilibili_cookie')))
+# Nano 引擎跑在独立 venv（funasr 与 faster-whisper/CTranslate2 依赖冲突，绝不合并装）
+# 建法见 SKILL.md「双引擎」章节：python -m venv <此路径> && pip install funasr
+PY_NANO = Path(os.environ.get('BILI_PYTHON_NANO', str(
+    CACHE / 'venvs' / 'asr_eval' / 'Scripts' / 'python.exe')))
+NANO_ADAPTER = Path(__file__).resolve().parent / 'funasr_adapter.py'
+UP_WHITELIST = Path(__file__).resolve().parent.parent / 'references' / 'engine_up_whitelist.txt'
+# 分区映射表不随本仓库分发（上游文档因合规原因已关停）；缺失时该信号自动跳过
+TID_V2_MAP = Path(os.environ.get('BILI_TID_MAP', str(
+    Path(__file__).resolve().parent.parent / 'references' / 'bilibili_tid_v2_map.txt')))
+
+# 关键词打分表：命中 NANO_HINTS +1，命中 WHISPER_HINTS -1，净分 >=1 建议 nano
+NANO_HINTS = (
+    # 地理/行政区划
+    '省', '市', '县', '区', '半岛', '群岛', '山脉', '盆地', '平原', '流域', '古城', '古镇',
+    '地理', '地图', '疆', '边境', '口岸', '迁徙', '民系', '方言',
+    # 历史
+    '朝', '皇帝', '王朝', '古国', '遗址', '文物', '考古', '科举', '封地', '避讳',
+    '宋', '明', '唐', '汉', '秦', '元', '清', '周', '徽宗', '康熙', '乾隆',
+    '史', '古代', '近代', '战争史', '起源', '变迁',
+    # 政经/国际
+    '地缘', '制裁', '关税', '财政', '化债', '选举', '战争', '条约', '联邦', '共和国',
+    '霍尔木兹', 'G7', 'G20', '北约', '欧盟', '东盟',
+)
+# 专名模式（正则命中 +1）：避免穷举地名，靠构词规律召回未知地名/人名
+NANO_PATTERNS = (
+    r'[\u4e00-\u9fa5]{2,4}为什么',      # 「XX为什么」
+    r'[\u4e00-\u9fa5]{2,6}是怎么',       # 「XX是怎么」
+    r'一口气(了解|看懂|讲完)',            # 系列科普
+    r'[\u4e00-\u9fa5]{2,3}(州|府|郡|城)的历史',
+)
+WHISPER_HINTS = (
+    'AI', 'ai', '模型', 'GPU', '芯片', '手机', '算法', '代码', '编程', '系统', '软件',
+    'OpenAI', 'Anthropic', 'Claude', 'GPT', '豆包', 'WorkBuddy', 'OpenClaw', 'Agent',
+    '评测', '教程', '方法论', '效率',
+)
+
+
+def load_up_whitelist():
+    """读 references/engine_up_whitelist.txt，返回 {UP主名: (引擎, 依据, 是否已实测)}"""
+    out = {}
+    if not UP_WHITELIST.is_file():
+        return out
+    for line in UP_WHITELIST.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = [p.strip() for p in line.split('|')]
+        if len(parts) >= 2 and parts[1] in ('whisper', 'funasr-nano'):
+            why = parts[2] if len(parts) > 2 else ''
+            kind = parts[4] if len(parts) > 4 else ''
+            out[parts[0]] = (parts[1], why, kind.startswith('实测'))
+    return out
+
+
+def fetch_video_tags(bvid):
+    """视频标签（官方 tag 接口）。实测比分区更能反映内容主题。"""
+    try:
+        j = http_json(f'https://api.bilibili.com/x/tag/archive/tags?bvid={bvid}', _H())
+        return [t.get('tag_name', '') for t in (j.get('data') or []) if t.get('tag_name')]
+    except Exception:
+        return []
+
+
+def load_tid_v2_map():
+    """读 references/bilibili_tid_v2_map.txt → {tid_v2: (子分区, 主分区)}"""
+    out = {}
+    if not TID_V2_MAP.is_file():
+        return out
+    for line in TID_V2_MAP.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = [p.strip() for p in line.split('|')]
+        if len(parts) >= 3:
+            out[parts[0]] = (parts[1], parts[2])
+    return out
+
+
+def classify_engine(meta, tags=None):
+    """按 UP主白名单 → 标题/简介关键词打分 → 默认 whisper 给出引擎建议。
+
+    代价不对称：漏切（仍是 whisper）= 维持现状；误切 = 慢 3-10 倍 + 英文质量下降。
+    所以灰区（净分 0 或无信号）一律判 whisper。
+    """
+    title = meta.get('title') or ''
+    desc = meta.get('desc') or ''
+    up = (meta.get('owner') or {}).get('name') or ''
+    text = f'{title} {desc}'
+
+    wl = load_up_whitelist()
+    if up in wl:
+        engine, why, verified = wl[up]
+        r = {'engine': engine, 'confidence': 'high', 'source': 'up_whitelist',
+             'up': up, 'reason': why or '白名单命中', 'verified': verified}
+        if not verified:
+            r['verify_hint'] = ('该 UP 主为标题归类、未经实测。本次跑完后请顺带做一次专名核对，'
+                                '结论写回 references/engine_up_whitelist.txt 并追加 engine_verify_log.txt')
+        return r
+
+    # 2) 视频 tag（官方公开标签接口，实测最准：地理类视频的 tag 多为地名）
+    if tags:
+        tag_text = ' '.join(tags)
+        t_nano = [k for k in NANO_HINTS if k in tag_text]
+        t_whisper = [k for k in WHISPER_HINTS if k in tag_text]
+        # tag 里地名/机构名占比高 → 专名密集
+        if len(t_nano) - len(t_whisper) >= 2:
+            return {'engine': 'funasr-nano', 'confidence': 'high', 'source': 'video_tag',
+                    'up': up, 'tags': tags[:10],
+                    'reason': f'tag 命中专名信号 {len(t_nano)} 个（如 {t_nano[:3]}）'}
+        if len(t_whisper) - len(t_nano) >= 2:
+            return {'engine': 'whisper', 'confidence': 'high', 'source': 'video_tag',
+                    'up': up, 'tags': tags[:10],
+                    'reason': f'tag 偏科技/英文向（{t_whisper[:3]}）'}
+
+    # 3) 分区（可选映射表，仅作辅助：实测地理类视频也被归到商业财经）
+    zmap = load_tid_v2_map()
+    tid_v2 = str(meta.get('tid_v2') or '')
+    if tid_v2 in zmap:
+        sub, main = zmap[tid_v2]
+        if any(k in sub + main for k in ('财经', '时政', '历史', '社科', '人文', '军事')):
+            return {'engine': 'funasr-nano', 'confidence': 'mid', 'source': 'zone',
+                    'up': up, 'zone': f'{main}·{sub}',
+                    'reason': f'分区 {main}·{sub} 属专名密集类（分区仅供辅助）'}
+        if any(k in sub + main for k in ('数码', '软件', '电脑', '编程')):
+            return {'engine': 'whisper', 'confidence': 'mid', 'source': 'zone',
+                    'up': up, 'zone': f'{main}·{sub}',
+                    'reason': f'分区 {main}·{sub} 偏技术向'}
+
+    hits_nano = [k for k in NANO_HINTS if k in text]
+    pat_hits = [p for p in NANO_PATTERNS if re.search(p, text)]
+    hits_whisper = [k for k in WHISPER_HINTS if k in text]
+    score = len(hits_nano) + len(pat_hits) - len(hits_whisper)
+    if score >= 1:
+        return {'engine': 'funasr-nano', 'confidence': 'mid' if score >= 2 else 'low',
+                'source': 'keyword', 'up': up, 'score': score,
+                'hits': (hits_nano + [f'pattern:{p[:12]}' for p in pat_hits])[:8],
+                'reason': f'标题/简介命中专名信号 {len(hits_nano) + len(pat_hits)} 个'}
+    return {'engine': 'whisper', 'confidence': 'default', 'source': 'default', 'up': up,
+            'score': score, 'hits_whisper': hits_whisper[:5],
+            'reason': '无明确专名信号或偏科技向，默认 whisper（漏切代价小于误切）'}
 
 
 # ---------------- 凭据 ----------------
@@ -42,8 +181,6 @@ def _uuid():
 
 _H = lambda: {'User-Agent': UA, 'Referer': 'https://www.bilibili.com/', 'Cookie': COOKIE_HEADER}
 COOKIE_HEADER = ''
-
-
 
 
 # ---------------- utils ----------------
@@ -81,7 +218,27 @@ def resolve_input(raw):
 
 
 # ---------------- 元信息 ----------------
+META_CACHE_DIR = Path(os.environ.get('BILI_META_CACHE', str(CACHE / 'meta')))
+META_CACHE_TTL = 86400  # 秒；24h 内复用元信息缓存，避免队列阶段一/阶段二重复抓 view
+
+
+def _meta_cache_path(bvid):
+    return META_CACHE_DIR / f'{bvid}.json'
+
+
 def fetch_meta(bvid_or_url, page, aid=None):
+    """取视频元信息（view 接口）。bvid 已知时优先读本地缓存，命中即跳过网络请求。"""
+    m_bv = re.search(r'(BV[0-9A-Za-z]{10})', bvid_or_url) if isinstance(bvid_or_url, str) else None
+    key = m_bv.group(1) if m_bv else None
+    if key:
+        cp = _meta_cache_path(key)
+        try:
+            if cp.is_file() and time.time() - cp.stat().st_mtime < META_CACHE_TTL:
+                cached = json.loads(cp.read_text(encoding='utf-8'))
+                if cached.get('bvid'):
+                    return cached
+        except Exception:
+            pass
     q = f"?bvid={bvid_or_url}" if bvid_or_url and bvid_or_url.startswith('BV') else f"?aid={aid}"
     if bvid_or_url and not bvid_or_url.startswith('BV'):
         url = bvid_or_url
@@ -90,7 +247,15 @@ def fetch_meta(bvid_or_url, page, aid=None):
     v = http_json('https://api.bilibili.com/x/web-interface/view' + q, _H())
     if v.get('code') != 0:
         raise RuntimeError(f"视频信息失败 [{v.get('code')}] {v.get('message')}")
-    return v['data']
+    data = v['data']
+    try:
+        if data.get('bvid'):
+            cp = _meta_cache_path(data['bvid'])
+            cp.parent.mkdir(parents=True, exist_ok=True)
+            cp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+    except Exception:
+        pass
+    return data
 
 
 def fetch_comments(aid, n=20):
@@ -126,11 +291,11 @@ def dedup_lines(lines):
 
 
 def fetch_subtitle_text(subs):
-    """选最优中文字幕并返回 (文本, 标签)；无可用字幕返回 (None, None)"""
+    """选最优中文字幕并返回 (文本, 标签)；无中文字幕返回 (None, None) 走 ASR。
+    不兜底取非中文字幕：中文视频拿英文 AI 字幕是回译，术语全部失真，宁可用本地 ASR。"""
     pick = (next((s for s in subs if re.match(r'^zh[-_]?CN$', s.get('lan', ''), re.I)), None)
             or next((s for s in subs if re.match(r'^ai[-_]?zh$', s.get('lan', ''), re.I)), None)
-            or next((s for s in subs if re.search(r'zh|cn', s.get('lan', ''), re.I)), None)
-            or (subs[0] if subs else None))
+            or next((s for s in subs if re.search(r'zh|cn', s.get('lan', ''), re.I)), None))
     if not pick:
         return None, None
     try:
@@ -172,29 +337,27 @@ def download_audio(url, out_dir, cookie=None, page=1, stem='audio'):
            '--ffmpeg-location', ffmpeg_path(),
            '--no-playlist', '-o', tpl, '--no-warnings', '--print-json']
     cu = url if 'p=' in url else f"{url}?p={page}"
-    # 明文 cookie 只在下载期间临时落盘，finally 里必定删除
     cf = None
     if cookie:
-        cf = out_dir / 'cookies.txt'
+        # Cookie 是账号凭据；使用唯一临时文件，并在 yt-dlp 返回后立刻清理。
+        cf = out_dir / f'_cookies_{os.getpid()}_{time.time_ns()}.txt'
         cf.write_text('# Netscape HTTP Cookie File\n' + '\n'.join(
             f".bilibili.com\tTRUE\t/\tFALSE\t0\t{c.split('=')[0].strip()}\t{c.split('=', 1)[1].strip()}"
             for c in cookie.split(';') if '=' in c), encoding='utf-8')
         cmd += ['--cookies', str(cf)]
     cmd.append(cu)
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True,
-                           encoding='utf-8', errors='replace')
-        if p.returncode != 0:
-            raise RuntimeError('音频下载失败: ' + (p.stderr or p.stdout)[-800:])
-        line = (p.stdout or '').strip().splitlines()[-1]
-        info = json.loads(line)
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
     finally:
-        # 登录凭据不留盘：Windows 上 chmod 权限不可靠，只能靠删除兜底
-        if cf is not None:
+        if cf:
             try:
-                cf.unlink()
+                cf.unlink(missing_ok=True)
             except Exception:
                 pass
+    if p.returncode != 0:
+        raise RuntimeError('音频下载失败: ' + (p.stderr or p.stdout)[-800:])
+    line = (p.stdout or '').strip().splitlines()[-1]
+    info = json.loads(line)
     # requested_downloads 可能是空列表，不能直接 [0]
     rd = info.get('requested_downloads') or []
     fp = (rd[0].get('filepath') if rd else '') or info.get('_filename')
@@ -284,6 +447,104 @@ def transcribe(audio, model_size, device, compute, lang, hf_mirror, prompt):
     return transcribe_with(model, dev, audio, lang, prompt)
 
 
+def nano_language(lang):
+    """bili_asr 的 --lang 默认 zh；Nano 侧用 auto 更安全（强制中文会让英文歌变错字）。"""
+    return 'auto' if (not lang or lang == 'zh') else lang
+
+
+def transcribe_nano(audio, lang='zh', hotwords_file=None, max_hotwords=80, timeout=7200):
+    """经独立 adapter 调 Fun-ASR-Nano。返回 (segments, meta)。
+
+    segments 结构与 faster-whisper 一致（start/end 秒 + text），供下游 merge/mark_ads 复用。
+    adapter 由 asr_eval 解释器运行，避免 funasr 依赖污染 whisper venv。
+    """
+    if not PY_NANO.is_file():
+        raise RuntimeError(f'Nano 引擎解释器不存在：{PY_NANO}')
+    if not NANO_ADAPTER.is_file():
+        raise RuntimeError(f'Nano adapter 缺失：{NANO_ADAPTER}')
+    # adapter 的 stdout 会混入 funasr 进度条/日志，必须走文件读结果，不能解析 stdout
+    out_json = Path(tempfile.gettempdir()) / f'_nano_out_{os.getpid()}.json'
+    if out_json.exists():
+        try:
+            out_json.unlink()
+        except Exception:
+            pass
+    cmd = [str(PY_NANO), str(NANO_ADAPTER), '--audio', str(audio), '--out', str(out_json),
+           '--quiet',
+           '--language', nano_language(lang)]
+    if hotwords_file:
+        cmd += ['--hotwords-file', str(hotwords_file), '--max-hotwords', str(max_hotwords)]
+    env = dict(os.environ)
+    env['PYTHONPATH'] = ''
+    env.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
+                       errors='replace', env=env, timeout=timeout)
+    if not out_json.is_file():
+        raise RuntimeError('Nano adapter 未产出结果文件: ' + (p.stderr or '')[-500:])
+    try:
+        j = json.loads(out_json.read_text(encoding='utf-8'))
+    except Exception:
+        raise RuntimeError('Nano adapter 结果非 JSON: ' + out_json.read_text(encoding='utf-8')[-300:])
+    finally:
+        try:
+            out_json.unlink()
+        except Exception:
+            pass
+    if not j.get('ok'):
+        raise RuntimeError(j.get('error') or 'Nano 转写失败')
+    # 有正文却解析不出时间戳 = 异常素材，不能进知识库（知识库依赖 [hh:mm:ss] 引用）
+    if j.get('timestamp_status') == 'no_ts':
+        raise RuntimeError('Nano 未返回可用时间戳（timestamp_status=no_ts），拒绝生成无时间戳素材包')
+    segs = [{'start': float(s.get('start') or 0.0),
+             'end': float(s.get('end') or 0.0),
+             'text': (s.get('text') or '').strip()} for s in (j.get('segments') or [])]
+    meta = {'language': lang or 'zh', 'duration': (segs[-1]['end'] if segs else 0.0),
+            'device': 'cuda', 'engine': 'funasr-nano',
+            'model': j.get('model'), 'load_sec': j.get('load_sec'),
+            'asr_sec': j.get('asr_sec'), 'hotwords_count': j.get('hotwords_count'),
+            'hotwords_sha256': j.get('hotwords_sha256'),
+            'hotwords_source_sha256': j.get('hotwords_source_sha256'),
+            'hotwords_truncated': j.get('hotwords_truncated'),
+            'hotwords_total': j.get('hotwords_total'),
+            'hotwords_status': j.get('hotwords_status')}
+    return segs, meta
+
+
+def run_nano_batch(batch_json, lang='zh', hotwords_file=None, timeout=21600):
+    """一次加载 Nano 模型处理整批音频，返回 adapter JSON（含 items[].segments）。"""
+    # 同 transcribe_nano：走文件读结果，避开 stdout 污染
+    out_json = Path(tempfile.gettempdir()) / f'_nano_batch_out_{os.getpid()}.json'
+    if out_json.exists():
+        try:
+            out_json.unlink()
+        except Exception:
+            pass
+    cmd = [str(PY_NANO), str(NANO_ADAPTER), '--batch-json', str(batch_json),
+           '--out', str(out_json), '--quiet',
+           '--language', nano_language(lang)]
+    if hotwords_file:
+        cmd += ['--hotwords-file', str(hotwords_file)]
+    env = dict(os.environ)
+    env['PYTHONPATH'] = ''
+    env.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
+                       errors='replace', env=env, timeout=timeout)
+    if not out_json.is_file():
+        raise RuntimeError('Nano adapter 未产出结果文件: ' + (p.stderr or '')[-500:])
+    try:
+        j = json.loads(out_json.read_text(encoding='utf-8'))
+    except Exception:
+        raise RuntimeError('Nano adapter 结果非 JSON: ' + out_json.read_text(encoding='utf-8')[-300:])
+    finally:
+        try:
+            out_json.unlink()
+        except Exception:
+            pass
+    if not j.get('ok'):
+        raise RuntimeError(j.get('error') or 'Nano 批量转写失败')
+    return j
+
+
 def merge_segments(segs, max_chars=90, max_gap=1.2, max_len=25.0):
     """合并短句为可读段落，保留时间戳"""
     blocks = []
@@ -355,13 +616,26 @@ def build_parser():
     ap.add_argument('--no-hf-mirror', dest='hf_mirror', action='store_false')
     ap.add_argument('--only-meta', action='store_true', help='仅抓元信息，不取字幕不转写')
     ap.add_argument('--force-asr', action='store_true', help='跳过 B站字幕直取，强制本地转写')
+    ap.add_argument('--engine', default='whisper', choices=['whisper', 'funasr-nano'],
+                    help='本地 ASR 引擎：whisper(默认) / funasr-nano(中文专名更强，独立 venv)')
+    ap.add_argument('--hotwords', default=None,
+                    help='热词文件路径（仅 --engine funasr-nano 生效）；每行一词，去重后硬上限 80')
+    ap.add_argument('--classify', action='store_true',
+                    help='只输出引擎建议（whisper/funasr-nano）+ 理由 + 置信度；'
+                         '配合 --only-meta 使用，走 view 缓存，零额外网络开销')
     ap.add_argument('--batch-file', default=None,
                     help='批量模式：JSON 文件 [{"url":..., "out":...}]，整批只加载一次模型')
     return ap
 
 
-def process_video(a, url_arg, out_path, holder=None):
-    """处理单个视频，返回结构化结果（不打印）。holder 非空时复用其模型实例。"""
+def process_video(a, url_arg, out_path, holder=None, preset=None):
+    """处理单个视频，返回结构化结果（不打印）。holder 非空时复用其模型实例。
+
+    preset: dict，批量预转写模式下传入 {'audio': 已下载音频路径, 'segments': 已转写段落,
+                                        'engine_meta': {...}}
+            传入时跳过下载与转写，直接组装素材包（避免 Nano 每条重复冷启动）。
+    """
+    t_meta = time.time()
     url, page, bvid = resolve_input(url_arg)
     V = fetch_meta(url, page)
     bvid = V['bvid']
@@ -384,9 +658,15 @@ def process_video(a, url_arg, out_path, holder=None):
     if len(pages) > 1:
         L += ['', '## 分P列表'] + [f"- P{p['page']} {p.get('part','')}（{fmt_dur(p.get('duration',0))})"
                                    + ('  ← 当前' if p['page'] == page else '') for p in pages]
-    ch, subs = fetch_player(bvid, cid)
-    if ch:
-        L += ['', '## 章节（UP主标记）'] + [f"- [{fmt_ts(c['from'])}] {c['content']}" for c in ch]
+
+    # 预扫描模式（--only-meta）只取 view 接口信息：fetch_meta 已含标题/简介/分P/统计。
+    # 不再请求 player(wbi) 与评论接口——省掉 /nav 与 reply 两个往返，判断"值不值得细看"够用。
+    ch, subs = [], []
+    if not a.only_meta:
+        ch, subs = fetch_player(bvid, cid)
+        if ch:
+            L += ['', '## 章节（UP主标记）'] + [f"- [{fmt_ts(c['from'])}] {c['content']}" for c in ch]
+    meta_sec = round(time.time() - t_meta, 2)
 
     logged_in = 'SESSDATA=' in COOKIE_HEADER.upper()
     route = None
@@ -394,10 +674,12 @@ def process_video(a, url_arg, out_path, holder=None):
     if not a.only_meta:
         # 路由 1：B站字幕直取（秒级，需登录态且视频开放字幕）
         if not a.force_asr and subs:
+            t_sub = time.time()
             sub_text, sub_label = fetch_subtitle_text(subs)
             if sub_text:
                 route = f'subtitle:{sub_label}'
                 L += ['', f'## 字幕全文（来源：{sub_label}）', '', sub_text]
+                meta_sec += round(time.time() - t_sub, 2)
 
         # 路由 2：本地 ASR 转写
         if route is None:
@@ -407,24 +689,52 @@ def process_video(a, url_arg, out_path, holder=None):
             elif not a.force_asr:
                 L += ['', '## 字幕',
                       '> 该视频未开放字幕，已降级为本地 ASR 转写。']
-            t0 = time.time()
-            AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-            fp, info = download_audio(url, AUDIO_DIR, COOKIE_HEADER, page, stem=f'{bvid}_p{page}')
-            dl = time.time() - t0
-            t1 = time.time()
-            if holder is None:
-                holder = ModelHolder(a.model, a.device, a.compute, a.hf_mirror)
-            model, dev = holder.get()
-            segs, meta = transcribe_with(model, dev, fp, a.lang, a.prompt)
+            if preset and preset.get('segments') is not None:
+                # 批量预转写：已下载并转写好的结果直接组装，不再下载/转写
+                segs = preset['segments']
+                meta = preset.get('engine_meta') or {}
+                dl, load_sec = 0.0, meta.get('load_sec') or 0.0
+                asr_sec = meta.get('asr_sec') or 0.0
+                engine_label = f'本地 Fun-ASR-Nano（{meta.get("model")}）'
+            else:
+                t_dl = time.time()
+                AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+                fp, info = download_audio(url, AUDIO_DIR, COOKIE_HEADER, page, stem=f'{bvid}_p{page}')
+                dl = time.time() - t_dl
+                t_asr = time.time()
+                if a.engine == 'funasr-nano':
+                    segs, meta = transcribe_nano(fp, a.lang, a.hotwords)
+                    load_sec = meta.get('load_sec') or 0.0
+                    engine_label = f'本地 Fun-ASR-Nano（{meta.get("model")}）'
+                else:
+                    t_load = time.time()
+                    if holder is None:
+                        holder = ModelHolder(a.model, a.device, a.compute, a.hf_mirror)
+                    model, dev = holder.get()
+                    load_sec = round(time.time() - t_load, 2)
+                    segs, meta = transcribe_with(model, dev, fp, a.lang, a.prompt)
+                    engine_label = f'本地 Whisper {a.model}'
+                asr_sec = round(time.time() - t_asr, 2)
+            asr_sec = round(asr_sec, 2)
             asr_info = {'audio_sec': round(meta['duration'], 1), 'download_sec': round(dl, 1),
-                        'asr_sec': round(time.time() - t1, 1), 'device': meta['device'],
-                        'model': a.model, 'segments': len(segs), 'lang': meta['language']}
+                        'model_load_sec': load_sec, 'asr_sec': asr_sec, 'device': meta['device'],
+                        'model': meta.get('model') or a.model, 'segments': len(segs),
+                        'lang': meta['language'],
+                        'engine': meta.get('engine', 'whisper'),
+                        'engine_model': meta.get('model')}
+            if a.engine == 'funasr-nano':
+                asr_info['hotwords_count'] = meta.get('hotwords_count')
+                asr_info['hotwords_sha256'] = meta.get('hotwords_sha256')
+                asr_info['hotwords_source_sha256'] = meta.get('hotwords_source_sha256')
+                asr_info['hotwords_truncated'] = meta.get('hotwords_truncated')
+                asr_info['hotwords_total'] = meta.get('hotwords_total')
+                asr_info['hotwords_status'] = meta.get('hotwords_status')
             blocks = merge_segments(segs)
             ad_kw = load_ad_keywords()
             ad_hits, ad_count = mark_ads(blocks, ad_kw)
             asr_info['ad_segments'] = ad_count
-            route = f'asr:{a.model}@{meta["device"]}'
-            L += ['', f"## 转写全文（本地 Whisper {a.model} · {meta['device']}）",
+            route = f'asr:{a.engine}:{a.model if a.engine == "whisper" else meta.get("model")}@{meta["device"]}'
+            L += ['', f"## 转写全文（{engine_label} · {meta['device']}）",
                   '> 标注 `[广告?]` 的行为疑似带货口播，生成纪要时跳过，不写入结论。', '']
             L += [f"[{fmt_ts(b['start'])}] {'[广告?] ' if b.get('is_ad') else ''}{b['text']}"
                   for b in blocks]
@@ -439,7 +749,7 @@ def process_video(a, url_arg, out_path, holder=None):
                 except Exception:
                     pass
 
-    if not a.no_comments:
+    if not a.only_meta and not a.no_comments:
         rs = fetch_comments(V['aid'])
         if rs:
             L += ['', '## 热门评论 Top20']
@@ -451,11 +761,15 @@ def process_video(a, url_arg, out_path, holder=None):
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding='utf-8')
-    return {'ok': True, 'bvid': bvid, 'title': V['title'], 'up': V['owner']['name'],
-            'duration': fmt_dur(pinfo.get('duration') or V['duration']),
-            'route': route, 'logged_in': logged_in,
-            'out': str(out).replace('\\', '/'), 'chars': len(text),
-            'asr': asr_info}
+    res = {'ok': True, 'bvid': bvid, 'title': V['title'], 'up': V['owner']['name'],
+           'duration': fmt_dur(pinfo.get('duration') or V['duration']),
+           'route': route, 'logged_in': logged_in,
+           'out': str(out).replace('\\', '/'), 'chars': len(text),
+           'asr': asr_info, 'timing': {'meta_sec': meta_sec}}
+    if a.classify:
+        # tag 是最准的信号；只在显式 --classify 时多调一次 tag 接口（很轻）
+        res['engine_suggestion'] = classify_engine(V, tags=fetch_video_tags(bvid))
+    return res
 
 
 def main():
@@ -471,6 +785,96 @@ def main():
             return
         holder = ModelHolder(a.model, a.device, a.compute, a.hf_mirror)
         results = []
+
+        # Nano 引擎：先下载全部音频，再一次性调 adapter（避免每条重复 50-70s 冷启动）
+        if a.engine == 'funasr-nano':
+            # outcomes 始终按输入顺序保存。不能把下载失败项先 append 到 results，
+            # 再 append 成功项；上游队列按顺序 zip 回填，乱序会串台账。
+            outcomes = []
+            prepped = []
+            for it in items:
+                try:
+                    url, page, _b = resolve_input(it['url'])
+                    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+                    fp, _info = download_audio(url, AUDIO_DIR, COOKIE_HEADER, page,
+                                               stem=f'{_b}_p{page}')
+                    rec = {'url': it['url'], 'out': it['out'], 'audio': fp, 'error': None}
+                    prepped.append(rec)
+                    outcomes.append(rec)
+                except Exception as e:
+                    outcomes.append({'url': it.get('url'), 'out': it.get('out'), 'audio': None,
+                                     'error': str(e)})
+            if prepped:
+                batch_json = Path(tempfile.gettempdir()) / '_nano_batch.json'
+                batch_json.write_text(json.dumps(
+                    [{'key': p['out'], 'audio': p['audio']} for p in prepped],
+                    ensure_ascii=False), encoding='utf-8')
+                try:
+                    j = run_nano_batch(batch_json, a.lang, a.hotwords)
+                    by_out = {x.get('key'): x for x in (j.get('items') or [])}
+                    first_nano_result = True
+                    for rec in outcomes:
+                        if rec['error']:
+                            results.append({'ok': False, 'url': rec['url'], 'error': rec['error']})
+                            continue
+                        item_result = by_out.get(rec['out'])
+                        segs = (item_result or {}).get('segments')
+                        if not segs:
+                            results.append({'ok': False, 'url': rec['url'],
+                                            'error': 'Nano 未返回带时间戳的正文（timestamp_status=empty），'
+                                                     '拒绝生成空素材包'})
+                            continue
+                        if (item_result or {}).get('timestamp_status') == 'no_ts':
+                            results.append({'ok': False, 'url': rec['url'],
+                                            'error': 'Nano 未返回可用时间戳（timestamp_status=no_ts），'
+                                                     '拒绝生成无时间戳素材包'})
+                            continue
+                        # load 是批级开销，仅记在首条；asr 是本条实际 generate 用时。
+                        emeta = {
+                            'model': j.get('model'),
+                            'load_sec': j.get('load_sec') if first_nano_result else 0.0,
+                            'asr_sec': item_result.get('asr_sec'),
+                            'engine': 'funasr-nano', 'device': 'cuda',
+                            'language': a.lang,
+                            'duration': item_result.get('audio_sec') or segs[-1].get('end', 0.0),
+                            'hotwords_count': j.get('hotwords_count'),
+                            'hotwords_sha256': j.get('hotwords_sha256'),
+                            'hotwords_source_sha256': j.get('hotwords_source_sha256'),
+                            'hotwords_truncated': j.get('hotwords_truncated'),
+                            'hotwords_total': j.get('hotwords_total'),
+                            'hotwords_status': j.get('hotwords_status'),
+                        }
+                        try:
+                            results.append(process_video(
+                                a, rec['url'], rec['out'], holder,
+                                preset={'audio': rec['audio'], 'segments': segs,
+                                        'engine_meta': emeta}))
+                            first_nano_result = False
+                        except Exception as e:
+                            results.append({'ok': False, 'url': rec['url'], 'error': str(e)})
+                except Exception as e:
+                    for rec in outcomes:
+                        results.append({'ok': False, 'url': rec['url'],
+                                        'error': rec['error'] or str(e)})
+                finally:
+                    # preset 路径绕过 process_video 的默认清理，须在批量收口处理。
+                    if not a.keep_audio:
+                        for rec in prepped:
+                            try:
+                                Path(rec['audio']).unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                    try:
+                        batch_json.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            else:
+                results = [{'ok': False, 'url': rec['url'], 'error': rec['error']}
+                           for rec in outcomes]
+            print(json.dumps({'ok': True, 'batch': True, 'count': len(results),
+                              'engine': 'funasr-nano', 'results': results}, ensure_ascii=False))
+            return
+
         for it in items:
             try:
                 results.append(process_video(a, it['url'], it['out'], holder))

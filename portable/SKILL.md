@@ -1,7 +1,7 @@
 ---
 name: bilibili-video-summary
 description: 用户发送 B站（bilibili）视频链接、BV号、av号或 b23.tv 短链，要求总结视频观点/要点/内容，或要求把视频内容整理成知识库条目时使用。通过本地 Whisper 模型下载音频并离线转写（GPU 加速），再基于转写全文生成 14 节知识库条目（含 YAML 元数据、检索入口表、实体表、时间线、待验证清单、术语表）。本版本为「便携版」——不依赖 WorkBuddy 与 IMA，纯标准 Python/Node 脚本 + Markdown 指令，可直接装到 Claude / Cursor / ChatGPT 自定义 GPT 等任意支持自定义指令的 AI 平台。触发词：B站、bilibili、BV号、b23.tv、这个视频讲了什么、总结视频、视频要点、存知识库、知识库条目、归档。
-version: 2.2.0-portable
+version: 2.5.1-portable
 agent_created: true
 ---
 
@@ -87,6 +87,48 @@ python scripts/bili_asr.py "<链接>" --model large-v3-turbo --out "素材包/bi
 1. **字幕直取**（秒级）：需登录态 + 视频开放 CC/AI 字幕 → 直接用
 2. **本地 ASR**（分钟级）：无字幕或匿名模式 → 下载音轨 + GPU 转写
 3. 返回 JSON 的 `route` 字段标明实际走了哪条路
+
+### 3b. 双引擎：whisper 与 Fun-ASR-Nano（v2.5.0 起）
+
+中文专名（人名、地名、机构、朝代、政策术语）是 ASR 的老大难，且 whisper 的错法往往是**同音合法词**（"隐性债务"→"险性债务"、"赵佶"→"赵庆"），AI 读到时不会起疑，错误会一路进正文和 entities，把正确名的检索入口堵死。
+
+| 引擎 | 强项 | 弱项 | 速度 |
+|---|---|---|---|
+| `large-v3-turbo`（whisper，默认） | 泛科技 / 英文术语 / 快速初筛 | 中文专名同音误识 | **20.5x** 实时 |
+| `funasr-nano`（Fun-ASR-Nano） | 中文专名显著更准（实测 10/11 vs 2/11） | 英文 token 易粘连 | 较慢 |
+
+**决策顺序**（`--classify` 给出建议，`--engine` 显式指定）：
+
+```bash
+# 1) 先拿元信息 + 引擎建议（不加载模型，几秒）
+python scripts/bili_asr.py "<链接>" --only-meta --classify
+# 2) 按建议转写（命中专名信号时 + 热词，否则只发挥一半效果）
+python scripts/bili_asr.py "<链接>" --engine funasr-nano --hotwords <热词文件> --out <素材包>
+```
+
+判定优先级：① `references/engine_up_whitelist.txt` 白名单 → ② **视频 tag**（官方公开接口，实测比分区准）→ ③ 分区（可选，需自备映射表）→ ④ 标题/简介关键词打分 → ⑤ 默认 whisper。
+
+**代价不对称**：漏切（仍用 whisper）= 维持现状；误切 = 慢 3-10 倍且英文质量下降。**灰区一律判 whisper。**
+
+**Nano 需要独立 venv**（funasr 与 faster-whisper 依赖冲突，绝不合并装）：
+
+```bash
+python -m venv "$HOME/.cache/bilibili-video-summary/venvs/asr_eval"
+"$HOME/.cache/bilibili-video-summary/venvs/asr_eval/bin/pip" install funasr
+# Windows 路径为 ...\venvs\asr_eval\Scripts\pip
+# 或用 BILI_PYTHON_NANO 指向你已有的 funasr 环境
+```
+
+### 3c. 专名纠错表与术语校验（生成纪要前必查）
+
+`references/asr_glossary.txt` 是**机器可读的误识对照表**（`错误写法 | 正确写法 | 语境限定`），专治"看起来没毛病"的误识：
+
+1. 生成纪要**之前**先查表，命中即按正确写法写入正文
+2. 正确写法进 `entities`/`tags`；**错误写法一律不得进 entities**
+3. 「语境限定」写 `ALL` 的无条件替换；写具体语境的只在命中时替换（历史内容里的"尧舜禹"是本义，不能动）
+4. 写完跑 `python scripts/check_glossary.py <纪要文件>` 兜底复核
+
+> 新增词条前先自问：这个词会不会在正常语境下合法出现？会 → 必须写语境限定，否则纠错表本身会制造错误。
 
 ### 4. 阅读素材包
 用 Read 读取 `out` 路径的 Markdown：基本信息、简介、分P、章节、带时间戳正文、热评 Top20。
@@ -296,10 +338,19 @@ python scripts/bili_asr.py --batch-file <items.json> --model large-v3-turbo
 **`BatchedInferencePipeline` 不要用。** 实测转写快 2.05x，但输出出现幻觉，且错别字明显增多。2 倍提速是拿质量换的，不值。
 
 ## 精度实测结论
-中文口语场景下，**turbo 与 large-v3 的准确率差距远小于 3 倍的速度差**：
-- large-v3 正确、turbo 错：生态位、姓魏的商人、小浣熊、沈殿霞
-- **两者共同短板**：人名、品牌名、金额数字（"安藤百福"→"安等/安登百福"；"一角五分"→"一脚五分/195分"）
-- 结论：**默认 turbo**。术语密集或需逐字引用时才用 large-v3；数字与专名在产出中一律标注 `[原文疑似]`，并在「信息完整性」列出误识对照表。
+
+**通用结论**：中文口语场景下 `large-v3-turbo` 与 `large-v3` 的准确率差距远小于 3 倍速度差 → **默认 turbo**。
+
+**但真正的短板不是模型大小，是语种适配**（v2.5.0 实测定稿）：
+
+| 场景 | 更优引擎 | 实测 |
+|---|---|---|
+| 中文专名密集（地名 / 人物 / 朝代 / 财政术语） | `funasr-nano` | 专名正确率 10/11，whisper 仅 2/11；"隐性债务"whisper 错 5 处（险性/隐姓），Nano 全对 |
+| 泛科技 / 英文产品名 / 快速初筛 | `large-v3-turbo` | 英文 token 在 Nano 下易粘连；turbo 快约 20x |
+
+共同短板：金额数字（"一角五分"→"一脚五分"）。所有专名与数字在产出中一律标注 `[原文疑似]`，并在「信息完整性」列出误识对照表；查 `references/asr_glossary.txt` 做强制纠错。
+
+**已验证不可用的提速方案**：`BatchedInferencePipeline` 实测快 2.05x，但凭空产生幻觉文本（多出"请不吝点赞 订阅 转发"等），且错字增加——不采用。
 
 ## 适配其他 AI 平台
 

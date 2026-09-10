@@ -7,12 +7,14 @@
   python library_queue.py --token <op_token>                 完整处理（补信息 + 转写）
   python library_queue.py --token <op_token> --meta-only     只查重 + 补元信息，不转写
   python library_queue.py --token <op_token> --limit 3       本次最多处理 3 条
+  python library_queue.py --token <op_token> --engine funasr-nano --hotwords <文件>
+                                                             中文专名密集批次改用 Nano 引擎（不传则 whisper）
   python library_queue.py --token <op_token> --database-id <id>
   python library_queue.py --token <op_token> --raw-dir <path>      纪要落盘目录
   python library_queue.py --token <op_token> --cache-dir <path>    素材包缓存目录
   python library_queue.py --token <op_token> --note-name BVxxx     只输出该 BV 的标准纪要文件名
   python library_queue.py --token <op_token> --finish BVxxx \
-      --summary <纪要路径> --ima 已转存                             收尾：回写台账 + 清理素材包
+      --summary <纪要路径> --ima 已转存                             收尾：回写台账 + 归档素材包
 
 行为:
   1. 读取台账全部记录
@@ -21,8 +23,9 @@
   4. 未重复：补元信息 → 转写（可选）→ 回写字段与状态
   5. 素材包落 --cache-dir（默认 $BILI_CACHE_DIR 或 ~/.workbuddy/cache/bili），不进知识库
   6. AI 生成纪要后落 --raw-dir（默认 $BILI_RAW_DIR 或 ~/obsidian/raw），命名见 note_name()
-  7. --finish 收尾：状态置「已完成」，并把缓存里的素材包删除
-  8. 输出 JSON，processed[].note_name 给出标准纪要文件名
+  7. --finish 收尾：只有素材包归档成功（已在 bili_subs 或成功 move）才置「已完成」；归档失败不动台账
+  8. 台账回写攒批提交（每 20 条或结尾 flush）；回写失败项进 report.write_failed 并以非零退出
+  9. 输出 JSON，processed[].note_name 给出标准纪要文件名
 
 状态列取值：待处理 / 已转写 / 已完成 / 失败 / 重复
 """
@@ -30,6 +33,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -40,6 +44,7 @@ from pathlib import Path
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
 
+# 路径从本文件推导 + 环境变量覆盖，避免写死机器相关路径
 SKILL_DIR = Path(__file__).resolve().parent
 BILI_ASR = SKILL_DIR / 'bili_asr.py'
 PY_ASR = Path(os.environ.get('BILI_PYTHON_ASR', sys.executable))
@@ -47,12 +52,9 @@ PY_LIB = Path(os.environ.get('BILI_PYTHON_LIB', sys.executable))
 
 
 def _pick_lib_dir():
-    """定位资料库插件目录：自动取 skill-library 下的最新版本，避免写死版本号。"""
-    base = Path(os.environ.get(
-        'BILI_LIBRARY_BASE',
-        str(Path.home() / '.workbuddy' / 'plugins' / 'cache'
-            / 'workbuddy-builtin' / 'skill-library')))
-    base = Path(base)
+    """定位资料库插件目录：自动取 skill-library 下最新版本，避免写死版本号。"""
+    base = Path(os.environ.get('BILI_LIBRARY_BASE', str(
+        Path.home() / '.workbuddy' / 'plugins' / 'cache' / 'workbuddy-builtin' / 'skill-library')))
     if not base.is_dir():
         return base
     cands = [d for d in base.iterdir() if d.is_dir()]
@@ -62,17 +64,18 @@ def _pick_lib_dir():
     def _ver(p):
         nums = re.findall(r'\d+', p.name)
         return tuple(int(n) for n in nums) if nums else (0,)
+
     return max(cands, key=_ver)
 
 
 LIB = Path(os.environ.get('BILI_LIBRARY_PLUGIN', str(_pick_lib_dir())))
 
-# 台账 database_id 属私有资源，改用环境变量注入，仓库内只留占位符
+# 台账 database_id 属私有资源，用环境变量注入，仓库内只留占位符
 DEFAULT_DB = os.environ.get('BILI_DATABASE_ID', '<YOUR_DATABASE_ID>')
 DEFAULT_RAW = Path(os.environ.get('BILI_RAW_DIR', str(Path.home() / 'obsidian' / 'raw')))
-# 素材包（转写全文）不进知识库，落缓存目录，--finish 收尾时删除
-DEFAULT_CACHE = Path(os.environ.get(
-    'BILI_CACHE_DIR', str(Path.home() / '.workbuddy' / 'cache' / 'bili')))
+# 素材包（转写全文）不进知识库，落缓存目录，--finish 收尾时归档到 bili_subs
+DEFAULT_CACHE = Path(os.environ.get('BILI_CACHE_DIR', str(
+    Path.home() / '.workbuddy' / 'cache' / 'bili')))
 
 ST_PENDING = '待处理'
 ST_TRANSCRIBED = '已转写'
@@ -133,6 +136,16 @@ def lib_api(token, script, args):
     return json.loads(out)
 
 
+def engine_args(a):
+    """把 --engine / --hotwords 透传给 bili_asr.py（避免队列悄悄跑回 whisper）"""
+    out = []
+    if getattr(a, 'engine', 'whisper') and a.engine != 'whisper':
+        out += ['--engine', a.engine]
+    if getattr(a, 'hotwords', None):
+        out += ['--hotwords', a.hotwords]
+    return out
+
+
 def run_bili(args, timeout=3600):
     e = dict(os.environ)
     e['PYTHONPATH'] = ''
@@ -151,11 +164,11 @@ def run_bili(args, timeout=3600):
     return j
 
 
-def run_bili_batch(items, model, timeout=7200):
-    """items: [{'url':..., 'out':...}]。整批只加载一次模型。"""
+def run_bili_batch(items, model, timeout=7200, extra=None):
+    """items: [{'url':..., 'out':...}]。整批只加载一次模型。extra 为透传参数（engine/hotwords）。"""
     tmp = Path(tempfile.gettempdir()) / '_bili_batch.json'
     tmp.write_text(json.dumps(items, ensure_ascii=False), encoding='utf-8')
-    j = run_bili(['--batch-file', str(tmp), '--model', model], timeout=timeout)
+    j = run_bili(['--batch-file', str(tmp), '--model', model] + (extra or []), timeout=timeout)
     return j.get('results', [])
 
 
@@ -199,7 +212,10 @@ def main():
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--up', help='只处理指定 UP主（按 UP主 列精确匹配）')
     ap.add_argument('--model', default='large-v3-turbo')
-    ap.add_argument('--finish', help='收尾模式：指定 BV号，回填纪要、状态置已完成、删除缓存素材包')
+    ap.add_argument('--engine', default='whisper', choices=['whisper', 'funasr-nano'],
+                    help='本地 ASR 引擎，透传给 bili_asr.py；Nano 适合专名密集内容')
+    ap.add_argument('--hotwords', default=None, help='热词文件路径，透传给 bili_asr.py（仅 Nano 生效）')
+    ap.add_argument('--finish', help='收尾模式：指定 BV号，回填纪要、状态置已完成、归档素材包到 bili_subs')
     ap.add_argument('--summary', help='纪要路径或链接，配合 --finish 使用')
     ap.add_argument('--ima', help='IMA转存状态：已转存 / 失败 / 不适用，配合 --finish 使用')
     ap.add_argument('--note-name', help='只输出该 BV号 的标准纪要文件名，不改动台账')
@@ -240,7 +256,7 @@ def main():
                          ensure_ascii=False, indent=2))
         return
 
-    # 2.5 收尾模式：AI 生成纪要后回填 + 清理素材包
+    # 2.5 收尾模式：AI 生成纪要后回填 + 归档素材包
     if a.finish:
         want = a.finish.strip()
         hits = [r for r in results
@@ -249,32 +265,60 @@ def main():
             print(json.dumps({'error': f'未找到 {want}'}, ensure_ascii=False))
             return
         today = datetime.now().strftime('%Y-%m-%d')
-        props = {'状态': {'select': ST_DONE}, '处理时间': {'date': today}}
+
+        # 素材包归档保留：从 cache/bili 挪到 cache/bili_subs（误识修正唯一依据，删除即放弃修正能力）
+        # 归档目录固定在 cache_dir 同级 bili_subs，不改动 index 结构
+        # 只有「已在归档目录」或「成功移动到归档目录」才算归档成功，才允许置「已完成」。
+        archive_dir = cache_dir.parent / 'bili_subs'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        idx = load_index(cache_dir)
+        item = idx.get(want, {})
+        dst = archive_dir / f'bili_{want}.md'
+        errs = []
+        archived = None
+        if dst.is_file():
+            # 已在归档目录（历史批次或此前已归档）
+            archived = str(dst)
+        else:
+            for p in dict.fromkeys([item.get('transcript', ''), str(cache_dir / f'bili_{want}.md')]):
+                if not p:
+                    continue
+                fp = Path(p)
+                if not fp.is_file():
+                    continue
+                if fp.resolve() == dst.resolve():
+                    archived = str(dst)
+                    break
+                try:
+                    shutil.move(str(fp), str(dst))
+                    archived = str(dst)
+                    break
+                except Exception as e:
+                    errs.append(f'{fp.name}: {e}')
+            if archived is None and not errs:
+                errs.append('素材包不存在（缓存与归档目录都没有）')
+
+        if archived is None:
+            # 归档失败：不动台账，保留原状态，等人工处理后重跑 --finish
+            print(json.dumps({'error': f'素材包归档失败：{want}',
+                              'archive_errors': errs,
+                              'hint': '请检查 cache/bili 或 bili_subs 下的素材包后重跑 --finish；台账状态未改动'},
+                             ensure_ascii=False, indent=2))
+            return
+
+        props = {'状态': {'select': ST_DONE}, '处理时间': {'date': today},
+                 '素材包': {'text': archived}}
         if a.summary:
             props['纪要'] = {'text': a.summary}
         if a.ima:
             props['IMA转存'] = {'select': a.ima}
-
-        # 素材包用完即删：不进知识库，只留一条清理痕迹
-        idx = load_index(cache_dir)
-        item = idx.get(want, {})
-        removed = []
-        for p in (item.get('transcript', ''), str(cache_dir / f'bili_{want}.md')):
-            if not p:
-                continue
-            fp = Path(p)
-            if fp.is_file():
-                fp.unlink()
-                removed.append(str(fp))
-        if removed:
-            props['素材包'] = {'text': f'已清理({today})'}
-        item['transcript'] = ''
+        item['transcript'] = archived
         idx[want] = item
         save_index(cache_dir, idx)
 
         update(a.token, a.database_id,
                [{'record_id': hits[0]['record_id'], 'properties': props}])
-        print(json.dumps({'finished': want, 'removed': removed,
+        print(json.dumps({'finished': want, 'archived': archived,
                           'properties': props}, ensure_ascii=False, indent=2))
         return
 
@@ -308,6 +352,35 @@ def main():
     today = datetime.now().strftime('%Y-%m-%d')
     stage1 = []  # [(rid, link, bv, meta)] 待转写
 
+    # 台账回写攒批：每 20 条 flush 一次，减少 batch_update API 往返
+    # flush 返回失败 record_id；失败项会从 processed 剔除并写入 report.write_failed，
+    # 避免「转写完成但台账未回填」被误判闭环。
+    pending = []
+    PENDING_MAX = 20
+    write_failed_ids = set()
+
+    def queue_update(rec):
+        pending.append(rec)
+        if len(pending) >= PENDING_MAX:
+            write_failed_ids.update(flush_updates())
+
+    def flush_updates():
+        if not pending:
+            return []
+        failed = []
+        try:
+            update(a.token, a.database_id, pending)
+        except Exception as e:
+            # 整批失败时逐条重试，坏记录单独失败不影响其余
+            print(f'    批量回写失败（{len(pending)}条）：{str(e)[:120]}，逐条重试', file=sys.stderr)
+            for rec in pending:
+                try:
+                    update(a.token, a.database_id, [rec])
+                except Exception:
+                    failed.append(rec['record_id'])
+        pending.clear()
+        return failed
+
     # 阶段一：查重 + 补元信息（不加载模型，每条 1-2s）
     for n, (rid, link, st) in enumerate(targets, 1):
         bv = extract_bvid(link)
@@ -323,7 +396,7 @@ def main():
                     '备注': {'text': '与已有记录重复，未重复处理'},
                 },
             }
-            update(a.token, a.database_id, [rec])
+            queue_update(rec)
             report['duplicates'].append({'record_id': rid, 'bvid': bv, 'link': link})
             print('    重复，已标记，跳过', file=sys.stderr)
             continue
@@ -336,7 +409,7 @@ def main():
                 props = {'BV号': {'text': bv}, 'UP主': {'text': meta['up']},
                          '视频标题': {'text': meta['title']}, '时长': {'text': meta['duration']},
                          '处理时间': {'date': today}, '状态': {'select': ST_PENDING}}
-                update(a.token, a.database_id, [{'record_id': rid, 'properties': props}])
+                queue_update({'record_id': rid, 'properties': props})
                 report['processed'].append({'record_id': rid, 'bvid': bv,
                                             'title': meta.get('title'),
                                             'up': meta.get('up'), 'note_name': ''})
@@ -346,8 +419,8 @@ def main():
         except Exception as e:
             msg = str(e)[:120]
             try:
-                update(a.token, a.database_id, [{'record_id': rid, 'properties': {
-                    '状态': {'select': '失败'}, '备注': {'text': msg}}}])
+                queue_update({'record_id': rid, 'properties': {
+                    '状态': {'select': '失败'}, '备注': {'text': msg}}})
             except Exception:
                 pass
             report['failed'].append({'record_id': rid, 'link': link, 'error': msg})
@@ -357,17 +430,17 @@ def main():
     if stage1:
         batch = [{'url': link, 'out': str(cache_dir / f'bili_{bv}.md')}
                  for rid, link, bv, meta in stage1]
-        print(f'\n批量转写 {len(batch)} 条（模型只加载一次）...', file=sys.stderr)
+        print(f'\n批量转写 {len(batch)} 条（模型只加载一次，engine={a.engine}）...', file=sys.stderr)
         t0 = time.time()
-        results = run_bili_batch(batch, a.model)
+        results = run_bili_batch(batch, a.model, extra=engine_args(a))
         print(f'批量转写完成，用时 {round(time.time() - t0)}s\n', file=sys.stderr)
 
         for (rid, link, bv, meta), r in zip(stage1, results):
             if not r.get('ok'):
                 msg = str(r.get('error', '转写失败'))[:120]
                 try:
-                    update(a.token, a.database_id, [{'record_id': rid, 'properties': {
-                        '状态': {'select': '失败'}, '备注': {'text': msg}}}])
+                    queue_update({'record_id': rid, 'properties': {
+                        '状态': {'select': '失败'}, '备注': {'text': msg}}})
                 except Exception:
                     pass
                 report['failed'].append({'record_id': rid, 'link': link, 'error': msg})
@@ -388,14 +461,24 @@ def main():
                        'up': meta.get('up', ''), 'transcript': str(out_md)}
             save_index(cache_dir, idx)
             nm = note_name(pubdate, meta.get('title', ''), meta.get('up', ''))
-            update(a.token, a.database_id, [{'record_id': rid, 'properties': props}])
+            queue_update({'record_id': rid, 'properties': props})
             handled[bv] = rid
             report['processed'].append({'record_id': rid, 'bvid': bv,
                                         'title': meta.get('title'),
                                         'up': meta.get('up'), 'note_name': nm})
-            print(f"    {bv} 转写完成 -> {out_md.name}（缓存，收尾时删除）", file=sys.stderr)
+            print(f"    {bv} 转写完成 -> {out_md.name}（缓存，--finish 收尾时归档）", file=sys.stderr)
 
+    write_failed_ids.update(flush_updates())
+    # 回写失败的项从 processed 剔除，进 write_failed——台账没回填 ≠ 闭环成功
+    if write_failed_ids:
+        report['processed'] = [p for p in report['processed']
+                               if p.get('record_id') not in write_failed_ids]
+        report['write_failed'] = sorted(write_failed_ids)
+    else:
+        report['write_failed'] = []
     print(json.dumps(report, ensure_ascii=False, indent=2))
+    # 有回写失败时以非零退出，提示调用方（转写产物已落盘，台账需补回填）
+    sys.exit(1 if write_failed_ids else 0)
 
 
 if __name__ == '__main__':

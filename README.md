@@ -130,16 +130,16 @@ python tests/test_core.py
 | `bilibili-video-summary-portable-vX.Y.Z.zip` | 解压到任意位置，把 `SKILL.md` 作为指令导入你的 AI 平台 |
 | `checksums.txt` | 各资产 SHA-256，下载后建议核对 |
 
-## 🆕 v2.2.0 更新（2026-09-05）
+## 🆕 v2.5.1 更新（2026-09-10）
 
-- ✅ **结构校验**：新增 `verify_structure.py`——frontmatter 齐全、tags/entities 数量、14 节齐全、要点表格化，四项硬拦截（源于产物退回旧模板的生产事故）
-- 🍪 **Cookie 自动导出**：新增 `chrome_cookie_export.py`——直接解密 Chrome 存储的 B站 Cookie 写入凭据文件（支持 v10/v11 加密；Chrome 127+ 的 v20 会识别并提示手动配置）
-- 🎯 **按 UP主 过滤**：`library_queue.py --up <UP主>`，在线表队列按系列分批处理
-- 🐛 修复：字幕直取路由下 `asr` 为 `null` 时台账回填崩溃
-- 🗄️ **素材包归档制**：转写全文不再随收尾删除（归档至 `cache/bili_subs/`），ASR 误识修正随时可回查
-- 📖 新增完整文档：断点恢复三步核实法、Cookie 持久化配置、IMA 归档踩坑清单
+- 🧠 **双引擎路由**：新增 **Fun-ASR-Nano** 支持，专治中文专名同音误识——实测专名正确率 **10/11 vs whisper 2/11**（"隐性债务"whisper 错成"险性债务"×5，Nano 全对）。`--classify` 按 UP主白名单 → 视频 tag → 关键词打分给出引擎建议
+- 📕 **专名纠错表**：新增 `references/asr_glossary.txt`（机器可读的 `误识 | 正确 | 语境限定`）+ `check_glossary.py` 兜底复核，拦截"看起来没毛病的合法中文词"类误识
+- 🔁 **自学习白名单**：`references/engine_up_whitelist.txt` + `engine_verify_log.txt`——UP主 → 引擎的映射可增量维护，判错留痕可追溯（本仓库只提供**模板**与维护规则，不含个人观看清单）
+- 🐛 修复：`requested_downloads` 为空列表时索引崩溃；批量队列不再清空用户手写备注
+- 🧩 重构：WBI 签名逻辑统一到 `bili_wbi.py`，路径全部改为 `__file__` / 环境变量派生（可迁移、可便携部署）
+- ⚖️ **合规**：撤下第三方"B站非公开接口文档"映射表（该上游因**律师函**已关停），改为只依赖公开 tag 接口
 
-完整变更见 [Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.2.0)。
+完整变更见 [Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.5.1)。历史版本见 v2.2.0 / v2.1.0。
 
 ## ❓ FAQ
 
@@ -194,9 +194,12 @@ bilibili-video-summary/
     ├── SKILL.md         # 完整指令——导入 AI 平台的就是它
     ├── requirements.txt
     ├── scripts/         # bili_asr.py / process_queue.py / bili.mjs / bili_wbi.py|mjs ...
-    │                    #   verify_structure.py 结构校验 · verify_coverage.py 覆盖校验
-    │                    #   chrome_cookie_export.py 自动导出 Chrome B站 Cookie（需 cryptography）
+    │                    #   funasr_adapter.py 第二引擎（Fun-ASR-Nano）适配层
+    │                    #   check_glossary.py 专名纠错复核 · verify_structure.py 结构校验
+    │                    #   verify_coverage.py 覆盖校验 · chrome_cookie_export.py Cookie 导出
     ├── references/      # 知识条目模板 / 广告过滤词表
+    │                    #   asr_glossary.txt 专名误识对照表
+    │                    #   engine_up_whitelist.txt + engine_verify_log.txt（模板）
     └── tests/           # 纯本地自测（13 项断言）
 ```
 

@@ -13,6 +13,7 @@ B站视频转录队列处理
   python process_queue.py --limit 3           本次最多处理 3 条
   python process_queue.py --bvid BV1xx        只处理指定视频
   python process_queue.py --model large-v3    指定转写模型
+  python process_queue.py --engine funasr-nano --hotwords <文件>   用 Nano 引擎 + 热词（中文专名更准）
   python process_queue.py --csv <path>        指定台账路径
 
 状态流转:
@@ -32,14 +33,13 @@ from pathlib import Path
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
 
-# 便携版：脚本位置从本文件推导，Python 用当前解释器（依赖已装在其环境中）
+# 路径从本文件推导 + 环境变量覆盖，避免写死机器相关路径
 SKILL_DIR = Path(__file__).resolve().parent
 BILI_ASR = SKILL_DIR / 'bili_asr.py'
 PY = Path(os.environ.get('BILI_PYTHON', sys.executable))
 
 DEFAULT_CSV = Path(os.environ.get(
-    'BILI_CSV',
-    str(Path.cwd() / 'bilibili_queue.csv')))
+    'BILI_CSV', str(Path.home() / 'obsidian' / 'bilibili_queue.csv')))
 
 COLS = ['序号', '视频链接', 'BV号', 'UP主', '视频标题', '时长', '状态',
         '转写耗时(秒)', '素材包', '纪要', '处理时间', '备注']
@@ -129,7 +129,7 @@ def show_status(csv_path):
               f"{r.get('UP主') or '-':16s} {(r.get('视频标题') or r.get('视频链接') or '-')[:40]}")
 
 
-def process(csv_path, do_transcribe, limit, only_bvid, model):
+def process(csv_path, do_transcribe, limit, only_bvid, model, engine='whisper', hotwords=None):
     rows = load(csv_path)
     if not rows:
         print('台账为空，先跑 --init 或手动粘贴链接')
@@ -183,8 +183,14 @@ def process(csv_path, do_transcribe, limit, only_bvid, model):
 
             if do_transcribe:
                 out_md = transcript_dir / f'bili_{bvid}.md'
-                print(f'    转写中（{model}）...')
-                res = run_bili([link, '--model', model, '--out', str(out_md)])
+                # 引擎/热词透传：不传则队列会悄悄跑回 whisper
+                extra = []
+                if engine and engine != 'whisper':
+                    extra += ['--engine', engine]
+                if hotwords:
+                    extra += ['--hotwords', hotwords]
+                print(f'    转写中（{engine}/{model}）...')
+                res = run_bili([link, '--model', model, '--out', str(out_md)] + extra)
                 rows[idx]['转写耗时(秒)'] = str(round(res.get('asr', {}).get('asr_sec', 0)))
                 rows[idx]['素材包'] = out_md.as_posix()
                 rows[idx]['状态'] = ST_TRANSCRIBED
@@ -217,6 +223,9 @@ def main():
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--bvid', default=None)
     ap.add_argument('--model', default='large-v3-turbo')
+    ap.add_argument('--engine', default='whisper', choices=['whisper', 'funasr-nano'],
+                    help='本地 ASR 引擎，透传给 bili_asr.py')
+    ap.add_argument('--hotwords', default=None, help='热词文件路径，透传给 bili_asr.py（仅 Nano 生效）')
     a = ap.parse_args()
 
     csv_path = Path(a.csv)
@@ -225,7 +234,8 @@ def main():
     elif a.status:
         show_status(csv_path)
     else:
-        process(csv_path, not a.meta_only, a.limit, a.bvid, a.model)
+        process(csv_path, not a.meta_only, a.limit, a.bvid, a.model,
+                getattr(a, 'engine', 'whisper'), getattr(a, 'hotwords', None))
 
 
 if __name__ == '__main__':
