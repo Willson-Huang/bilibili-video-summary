@@ -9,9 +9,9 @@
 
 **把 B站视频，变成半年后还能搜到的知识笔记。**
 
-本地 Whisper 离线转写（GPU 加速）→ 基于全文（而非标题简介）→ 固定 14 节结构化 Markdown 条目。
+字幕直取（秒级）或本地双引擎转写（whisper 快约 20 倍 / Fun-ASR-Nano 中文专名更准）→ 专名纠错 + 广告过滤 → 固定 14 节结构化条目，经结构校验后交付。
 
-**EN** — Turn a Bilibili video into a knowledge note you can still search six months later: local Whisper transcription (offline, GPU-accelerated) plus a fixed 14-section Markdown template with timestamps, entity tables and a claims-to-verify list.
+**EN** — Turn a Bilibili video into a knowledge note you can still search six months later: official subtitles in seconds, or local dual-engine ASR (whisper ≈20× faster, Fun-ASR-Nano far better on Chinese proper nouns), then proper-noun correction + ad filtering, and finally a fixed 14-section Markdown entry that must pass structure validation.
 
 [Releases](https://github.com/Willson-Huang/bilibili-video-summary/releases/latest) · [更新日志](#-更新日志最新在上) · [真实输出示例](examples/2025-07-25_哲学知识分享——熵增与熵减_荣格不吃炸鸡_纪要.md) · [快速开始](#-快速开始三选一) · [FAQ](#-faq)
 
