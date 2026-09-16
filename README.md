@@ -105,14 +105,14 @@
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
-| **v2.6.6** | 2026-09-16 | 素材包校验与自描述 · 不可信输入防御 · 查重语义收敛（含 v2.6.1–v2.6.5 的迭代） |
+| **[v2.6.6](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.6)** | 2026-09-16 | 素材包校验与自描述 · 不可信输入防御 · 查重语义收敛（含 v2.6.1–v2.6.5 的迭代） |
 | [v2.6.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.0) | 2026-09-16 | 进度看板子系统（零依赖独立窗口）· 引擎速度基准 · 队列 `--force-asr` 透传 |
 | [v2.5.2](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.5.2) | 2026-09-10 | 文档修正：AI 字幕经回译、专名不可信（含路由与验证基准的使用边界） |
 | [v2.5.1](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.5.1) | 2026-09-10 | 双引擎路由（whisper ↔ Fun-ASR-Nano）· 专名纠错表 · 白名单自学习 |
 | [v2.2.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.2.0) | 2026-09-05 | 结构校验 · Cookie 自动导出 · 队列按 UP主 过滤 · 合规加固 |
 | [v2.1.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.1.0) | 2026-08-30 | 首次发布：WorkBuddy 原版 + 跨平台便携版 |
 
-### v2.6.6 — 2026-09-16
+### v2.6.6 — 2026-09-16　[Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.6)
 
 > 本版是 v2.6.1 → v2.6.6 的连续迭代，已合并为一个版本；下面只留有实际影响的部分。
 
