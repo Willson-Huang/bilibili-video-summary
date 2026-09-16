@@ -8,7 +8,10 @@
   python library_queue.py --token <op_token> --meta-only     只查重 + 补元信息，不转写
   python library_queue.py --token <op_token> --limit 3       本次最多处理 3 条
   python library_queue.py --token <op_token> --engine funasr-nano --hotwords <文件>
-                                                             中文专名密集批次改用 Nano 引擎（不传则 whisper）
+                                                              中文专名密集批次改用 Nano 引擎（不传则 whisper）
+  python library_queue.py --token <op_token> --engine funasr-nano --force-asr
+                                                              专名密集批次强制跳过字幕走本地 ASR
+                                                              （B站 AI 字幕经中英回译，专名不可信）
   python library_queue.py --token <op_token> --database-id <id>
   python library_queue.py --token <op_token> --raw-dir <path>      纪要落盘目录
   python library_queue.py --token <op_token> --cache-dir <path>    素材包缓存目录
@@ -82,15 +85,19 @@ ST_TRANSCRIBED = '已转写'
 ST_DONE = '已完成'
 ST_DUP = '重复'
 
-INVALID_CHARS = re.compile(r'[\\/:*?"<>|\r\n\t]')
+INVALID_CHARS = re.compile(r'[\\:*?"<>|\r\n\t]')
 
 
 def note_name(pubdate, title, up):
     """标准纪要文件名：<发布日>_<完整标题>_<UP主>_纪要.md
 
     标题原文照抄，只剔除 Windows 非法字符与换行空白，全角标点（，？【】）保留。
+    `/` 例外：**替换为 `、`，不是删除**——保住可读性（删了 `Cola/codex` 会粘成
+    `Colacodex`），反查 BV 时归一化需同时忽略 `/` 与 `、` 才能对上。SKILL.md 一直是
+    这么规定的，但代码此前是删除，导致历史产物两种写法并存（2026-09-14 对齐）。
     """
     base = f'{pubdate}_{title}_{up}_纪要'
+    base = base.replace('/', '、')          # 必须先替换再清非法字符，顺序不能反
     base = INVALID_CHARS.sub('', base)
     base = re.sub(r'\s+', ' ', base).strip()
     return base + '.md'
@@ -137,12 +144,14 @@ def lib_api(token, script, args):
 
 
 def engine_args(a):
-    """把 --engine / --hotwords 透传给 bili_asr.py（避免队列悄悄跑回 whisper）"""
+    """把 --engine / --hotwords / --force-asr 透传给 bili_asr.py（避免队列悄悄跑回 whisper 或吃回译字幕）"""
     out = []
     if getattr(a, 'engine', 'whisper') and a.engine != 'whisper':
         out += ['--engine', a.engine]
     if getattr(a, 'hotwords', None):
         out += ['--hotwords', a.hotwords]
+    if getattr(a, 'force_asr', False):
+        out += ['--force-asr']
     return out
 
 
@@ -215,6 +224,9 @@ def main():
     ap.add_argument('--engine', default='whisper', choices=['whisper', 'funasr-nano'],
                     help='本地 ASR 引擎，透传给 bili_asr.py；Nano 适合专名密集内容')
     ap.add_argument('--hotwords', default=None, help='热词文件路径，透传给 bili_asr.py（仅 Nano 生效）')
+    ap.add_argument('--force-asr', action='store_true',
+                    help='透传给 bili_asr.py：强制跳过字幕直取走本地 ASR。'
+                         '专名密集内容（历史/地理/政经）即使有 B站 AI 字幕也应带上——AI 字幕经中英回译，专名不可信')
     ap.add_argument('--finish', help='收尾模式：指定 BV号，回填纪要、状态置已完成、归档素材包到 bili_subs')
     ap.add_argument('--summary', help='纪要路径或链接，配合 --finish 使用')
     ap.add_argument('--ima', help='IMA转存状态：已转存 / 失败 / 不适用，配合 --finish 使用')

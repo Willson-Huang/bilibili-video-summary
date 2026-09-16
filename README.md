@@ -31,12 +31,27 @@
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
-| **v2.5.2** | 2026-09-10 | 文档修正：AI 字幕经回译、专名不可信（含路由与验证基准的使用边界） |
+| **v2.6.0** | 2026-09-16 | 进度看板子系统（零依赖独立窗口）· 引擎速度基准 · 队列 `--force-asr` 透传 |
+| [v2.5.2](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.5.2) | 2026-09-10 | 文档修正：AI 字幕经回译、专名不可信（含路由与验证基准的使用边界） |
 | [v2.5.1](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.5.1) | 2026-09-10 | 双引擎路由（whisper ↔ Fun-ASR-Nano）· 专名纠错表 · 白名单自学习 |
 | [v2.2.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.2.0) | 2026-09-05 | 结构校验 · Cookie 自动导出 · 队列按 UP主 过滤 · 合规加固 |
 | [v2.1.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.1.0) | 2026-08-30 | 首次发布：WorkBuddy 原版 + 跨平台便携版 |
 
-### v2.5.2 — 2026-09-10　[Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.5.2)
+### v2.6.0 — 2026-09-16　[Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.0)
+
+- 📊 **进度看板子系统**：新增 `progress_hub.py` + `dashboard.html` + `bili_dashboard.bat`——**零第三方依赖**（stdlib only）的独立窗口看板，见 [预览图](#-进度看板mission-control)
+  - 写入端每进程独立 `events_<pid>.jsonl`，不抢锁、不会交错损坏，**进程崩了只丢自己那一份**
+  - 读取端 `--serve` 聚合 `run.json` + 全部事件 + 快照，输出 `/api/state`，前端 700ms 轮询
+  - 承载转写与纪要两类任务；支持任务组区分、失败重试计数、疑似卡死提示、事件流
+  - Windows 上叠加 `CREATE_BREAKAWAY_FROM_JOB` 逃出宿主 Job Object，流水线结束后看板仍存活
+- ⚡ **引擎速度基准**：新增 `references/perf-benchmark-2026-09-13.md`（原始实测依据）——起因是 Nano 实跑明显慢于 whisper，需判定"配置问题"还是"架构上限"
+- 🔧 **队列 `--force-asr` 透传**：`library_queue.py --force-asr`——专名密集批次强制跳过字幕走本地 ASR，与 v2.5.2 的字幕来源分级配套
+- 🐛 **新踩坑记录**：直跑 `bili_asr.py --batch-file` **不会写 `index.json`**（绕过 token 过期时常用的做法），随后 `--note-name` 会失效——文档给出手工补 index 的四字段写法
+- 🧪 **前端回归测试**：新增 `tests/test_dashboard_times.js`（桩 DOM + 可控时钟，17 条断言）——曾两次踩到 JS 静默失效（数字冻结在旧值、页面无报错），故单独钉一个 JS 测试
+- 🔒 发布前脱敏：白名单/验证日志重置为纯模板、性能基准移除 GPU 型号与真实样本号、看板演示数据全部中性化
+
+<details>
+<summary><b>v2.5.2 — 2026-09-10</b>　AI 字幕经回译，专名不可信（点击展开）</summary>
 
 - ⚠️ **修正一处会误导使用的表述**：此前文档把"有 B站官方字幕"写成「零识别错误，永远优先」——**这只对人工 CC 字幕成立**
 - 🔍 **明确字幕来源分级**（素材包「字幕」行会标注，`--force-asr` 可强制跳过字幕走本地转写）：
@@ -44,6 +59,8 @@
   - `ai-zh` **B站 AI 生成** → **经中文 → 英文 → 中文回译**，地名 / 人名 / 机构名偏差可能很大（同音替代 + 回译错译），**不可作验证基准**
 - 🧭 **路由与验证的使用边界**：专名密集内容（历史 / 地理 / 政经）即使有 AI 字幕，也建议 `--force-asr --engine funasr-nano` 走本地转写；用"字幕对照"验证引擎时，基准必须用人工 CC 字幕，只有 AI 字幕时结论需再用常识复核
 - 📝 同步修正：README 流程图说明、FAQ、两版 SKILL.md 的路由逻辑与引擎分流表
+
+</details>
 
 ### v2.5.1 — 2026-09-10　[Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.5.1)
 
@@ -90,7 +107,7 @@
 
 这个工具把音轨拉下来，用本地 Whisper 转写成**带时间戳的全文**，再基于全文产出 14 节知识条目：每条结论可回跳时间点，每个存疑处标注 `[原文疑似]`，转写数据不出你的电脑。
 
-| ⏱️ 实测性能（RTX 4060 Ti） | |
+| ⏱️ 实测性能（NVIDIA GPU） | |
 |---|---|
 | 2 分 24 秒视频 → 拿到全文转写 | **12 秒**（下载 2.0s + 转写 8.8s） |
 | 1 小时视频推算 | **约 3 分钟**（large-v3-turbo @ CUDA） |
@@ -124,6 +141,30 @@ graph LR
 | **字幕直取** | 配置 B站 Cookie 后直接拉取字幕（秒级）；无字幕或未配置 Cookie 时自动降级为本地转写。音轨下载后不转码、转写完即删。⚠️ **"有字幕"不等于可信**：`zh-CN` = 人工 CC（可信，可作核对基准）；`ai-zh` = B站 AI 生成，**经中文 → 英文 → 中文回译**，地名人名偏差大，**不可作验证基准**——专名密集内容建议 `--force-asr` 走本地 `funasr-nano` |
 | **引擎路由** | 无字幕时按 `UP主白名单 → 视频 tag → 关键词打分` 选引擎（`--only-meta --classify` 给出建议）：`whisper` 快约 20 倍，`Fun-ASR-Nano` 中文专名更准（实测 10/11 vs 2/11）；灰区一律判 whisper |
 | **纠错与校验** | `asr_glossary.txt` 强制纠正"看起来没毛病的合法中文词"类误识；产出必须过 `verify_structure.py` 四项硬拦截（frontmatter / tags·entities 数量 / 14 节齐全 / 要点表格化）|
+
+## 📊 进度看板（Mission Control）
+
+批量转写动辄几十分钟，"黑盒等待"是最难熬的部分。v2.6.0 起内置一个**零第三方依赖**（stdlib only）的独立进度看板——不占用终端、不引入包依赖冲突风险：
+
+![进度看板预览](docs/dashboard-preview.png)
+
+```bash
+# 启动（写入端由管线自动上报，无需手动喂数据）
+python scripts/progress_hub.py --serve --port 8765 --dir <运行目录> --open
+# Windows 可一键启动
+scripts/bili_dashboard.bat [运行目录] [端口]
+# 想先看外观：生成演示数据
+python scripts/progress_hub.py --demo --dir <运行目录> && python scripts/progress_hub.py --serve --dir <运行目录> --open
+```
+
+| 设计要点 | 说明 |
+|---|---|
+| **每进程独立事件文件** | 各进程写自己的 `events_<pid>.jsonl`，**不抢锁、不会交错损坏**；进程崩了只丢自己那一份 |
+| **两类任务同框** | 转写与纪要进度都进同一个看板，可按任务组区分来源 |
+| **失败看得见** | 失败计数 + 重试次数 + 事件流，避免"跑了一夜才发现挂了 3 条" |
+| **独立窗口** | Windows 上叠加 `CREATE_BREAKAWAY_FROM_JOB` 逃出宿主 Job Object——流水线结束后看板仍存活 |
+
+> 上图为 `--demo` 生成的中性演示数据（非真实视频）。
 
 ## 🚀 快速开始（三选一）
 
@@ -268,6 +309,7 @@ AI 平台看不到视频内容，只能基于标题/简介/评论猜。本工具
 
 ```
 bilibili-video-summary/
+├── docs/                # 文档配图（进度看板预览图）
 ├── examples/            # 真实产出示例（本工具自己生成的 14 节纪要）
 ├── workbuddy/           # WorkBuddy 原版（SKILL.md + scripts + references + tests）
 └── portable/            # 便携版（无平台依赖）
@@ -275,12 +317,14 @@ bilibili-video-summary/
     ├── requirements.txt
     ├── scripts/         # bili_asr.py / process_queue.py / bili.mjs / bili_wbi.py|mjs ...
     │                    #   funasr_adapter.py 第二引擎（Fun-ASR-Nano）适配层
+    │                    #   progress_hub.py + dashboard.html + bili_dashboard.bat 进度看板
     │                    #   check_glossary.py 专名纠错复核 · verify_structure.py 结构校验
     │                    #   verify_coverage.py 覆盖校验 · chrome_cookie_export.py Cookie 导出
     ├── references/      # 知识条目模板 / 广告过滤词表
     │                    #   asr_glossary.txt 专名误识对照表
     │                    #   engine_up_whitelist.txt + engine_verify_log.txt（模板）
-    └── tests/           # 纯本地自测（13 项断言）
+    │                    #   perf-benchmark-*.md 引擎速度基准原始数据
+    └── tests/           # Python 自测 + 看板前端 JS 回归测试
 ```
 
 ## 注意事项

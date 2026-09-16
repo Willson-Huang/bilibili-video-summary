@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -40,6 +41,96 @@ sys.stderr.reconfigure(encoding='utf-8')
 
 MODEL_ID = 'FunAudioLLM/Fun-ASR-Nano-2512'
 DEFAULT_MAX_HOTWORDS = 80
+# VAD 分段并发解码数。默认 1 —— 保留已知良好行为。
+# 实测（NVIDIA GPU 8GB，180s 与 24:43 全长音频）：1/4/8/16 的实时倍率
+# 分别是 5.07/5.01/5.06/5.04x，**并发解码对本卡零收益**（GPU 由单进程即吃满，
+# 双进程并发实测加速比仅 1.04x）。且 batch=4/8 时个别词与 batch=1 不一致（解码
+# 非确定性），batch=16 才完全一致——用参数换不来速度却可能换掉稳定性，故默认 1。
+# 该参数保留是给未来换更大显存的卡预留调优入口。
+DEFAULT_INFER_BATCH = 1
+
+
+# --------------------------------------------------------------------------- #
+# 进度上报（可选）
+# 由环境变量 BILI_PROGRESS_DIR 启用；未设置时全部为空操作。
+# 任何异常一律吞掉 —— 进度是旁路，绝不能让看板拖垮转写。
+# Nano 一次 generate 处理整条音频、没有细粒度回调，故按
+# 「已用时间 / (音频时长 ÷ 实测倍率 5.08)」插值出百分比。
+# --------------------------------------------------------------------------- #
+def _hub():
+    if not os.environ.get('BILI_PROGRESS_DIR'):
+        return None
+    try:
+        me = str(Path(__file__).resolve().parent)
+        if me not in sys.path:
+            sys.path.insert(0, me)
+        import progress_hub
+        return progress_hub
+    except Exception:
+        return None
+
+
+def _dur_sec(wav):
+    """读 wav 时长（秒）。失败返回 None。"""
+    try:
+        import wave
+        with wave.open(str(wav)) as w:
+            return round(w.getnframes() / float(w.getframerate() or 1), 1)
+    except Exception:
+        return None
+
+
+class _AsrReporter:
+    """单条音频的转写进度上报器：起始 + 定时插值 + 结束。"""
+
+    INTERVAL = 3.0
+
+    def __init__(self, key, wav, label=None):
+        self.h = _hub()
+        self.task = None
+        self.dur = None
+        self.t0 = None
+        self._stop = threading.Event()
+        self._th = None
+        if not self.h:
+            return
+        try:
+            self.task = self.h.task_of(key)
+            self.dur = _dur_sec(wav)
+            self.t0 = time.time()
+            self.h.auto(task=self.task, stage='asr', pct=1.0, duration_sec=self.dur,
+                        started=self.t0, note=(label or '转写中'))
+            self._th = threading.Thread(target=self._loop, daemon=True)
+            self._th.start()
+        except Exception:
+            self.h = None
+
+    def _loop(self):
+        while not self._stop.wait(self.INTERVAL):
+            try:
+                el = time.time() - self.t0
+                pct = self.h.pct_from_elapsed(el, self.dur)
+                self.h.auto(task=self.task, stage='asr', pct=pct, elapsed=round(el, 1),
+                            note='转写中 %s%%' % (('%.0f' % pct) if pct is not None else '?'))
+            except Exception:
+                pass
+
+    def done(self, asr_sec=None, note='转写完成'):
+        try:
+            self._stop.set()
+            if self.h:
+                self.h.auto(task=self.task, stage='done', pct=100.0,
+                            elapsed=round(asr_sec, 1) if asr_sec else None, note=note)
+        except Exception:
+            pass
+
+    def fail(self, why):
+        try:
+            self._stop.set()
+            if self.h:
+                self.h.auto(task=self.task, stage='fail', note=str(why)[:120])
+        except Exception:
+            pass
 
 
 def load_hotwords(path, limit):
@@ -167,6 +258,9 @@ def main():
                          '强制指定语言会导致外语内容(如英文歌)被硬转成中文错字')
     ap.add_argument('--hotwords-file', default=None)
     ap.add_argument('--max-hotwords', type=int, default=DEFAULT_MAX_HOTWORDS)
+    ap.add_argument('--infer-batch-size', type=int, default=DEFAULT_INFER_BATCH,
+                    help='VAD 分段并发解码数（默认 %d）。=1 时每段单独解码，'
+                         '长音频下 GPU 利用率极低、实时倍率掉到 2x；调大可显著提速' % DEFAULT_INFER_BATCH)
     ap.add_argument('--quiet', action='store_true')
     a = ap.parse_args()
 
@@ -218,8 +312,10 @@ def main():
             wav = ensure_wav(it['audio'])
             converted = Path(wav) != Path(it['audio'])
             t_item = time.time()
+            rep = _AsrReporter(it.get('key'), wav)
             try:
-                gen_kw = dict(input=[wav], cache={}, batch_size=1, language=a.language, itn=True)
+                gen_kw = dict(input=[wav], cache={}, batch_size=a.infer_batch_size,
+                              language=a.language, itn=True)
                 # hotwords 为空时不能传 None：funasr 内部会对 None 取 len() 而崩溃
                 if hotwords:
                     gen_kw['hotwords'] = hotwords
@@ -237,10 +333,16 @@ def main():
                         ts_status = 'no_ts'
                     else:
                         ts_status = 'empty'
+                asr_sec = round(time.time() - t_item, 2)
+                rep.done(asr_sec, note='转写完成 %ss · %.1fx' % (
+                    asr_sec, (rep.dur / asr_sec) if (rep.dur and asr_sec) else 0))
                 per_item.append({'key': it.get('key'), 'audio': it['audio'], 'segments': segs,
-                                 'asr_sec': round(time.time() - t_item, 2),
+                                 'asr_sec': asr_sec,
                                  'timestamp_status': ts_status,
                                  'audio_sec': (segs[-1]['end'] if segs else 0.0)})
+            except Exception as _e:
+                rep.fail('%s: %s' % (type(_e).__name__, _e))
+                raise
             finally:
                 # m4a 的 16k wav 是 adapter 内部临时产物，绝不留在共享音频目录。
                 if converted:

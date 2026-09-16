@@ -17,15 +17,14 @@ sys.stderr.reconfigure(encoding='utf-8')
 # WBI 签名 / HTTP 公共能力抽到 bili_wbi.py，与 search_bili.py 共用
 from bili_wbi import UA, http_json, wbi_url
 HOME = Path.home()
-# 便携版：缓存与凭据统一放用户级缓存目录，不依赖任何平台私有目录
-CACHE = Path(os.environ.get('BILI_CACHE', str(HOME / '.cache' / 'bilibili-video-summary')))
-MODEL_DIR = Path(os.environ.get('BILI_MODEL_DIR', str(CACHE / 'models' / 'whisper')))
-AUDIO_DIR = Path(os.environ.get('BILI_TMP', str(CACHE / 'tmp' / 'bili_audio')))
-COOKIE_FILE = Path(os.environ.get('BILI_COOKIE', str(CACHE / '.bilibili_cookie')))
+# 路径全部可用环境变量覆盖，便于迁移到其他机器 / 便携部署
+MODEL_DIR = Path(os.environ.get('BILI_MODEL_DIR',
+                                str(HOME / '.workbuddy' / 'models' / 'whisper')))
+AUDIO_DIR = Path(os.environ.get('BILI_TMP', str(HOME / '.workbuddy' / 'tmp' / 'bili_audio')))
+COOKIE_FILE = Path(os.environ.get('BILI_COOKIE', str(HOME / '.workbuddy' / '.bilibili_cookie')))
 # Nano 引擎跑在独立 venv（funasr 与 faster-whisper/CTranslate2 依赖冲突，绝不合并装）
-# 建法见 SKILL.md「双引擎」章节：python -m venv <此路径> && pip install funasr
 PY_NANO = Path(os.environ.get('BILI_PYTHON_NANO', str(
-    CACHE / 'venvs' / 'asr_eval' / 'Scripts' / 'python.exe')))
+    HOME / '.workbuddy' / 'binaries' / 'python' / 'envs' / 'asr_eval' / 'Scripts' / 'python.exe')))
 NANO_ADAPTER = Path(__file__).resolve().parent / 'funasr_adapter.py'
 UP_WHITELIST = Path(__file__).resolve().parent.parent / 'references' / 'engine_up_whitelist.txt'
 # 分区映射表不随本仓库分发（上游文档因合规原因已关停）；缺失时该信号自动跳过
@@ -218,7 +217,7 @@ def resolve_input(raw):
 
 
 # ---------------- 元信息 ----------------
-META_CACHE_DIR = Path(os.environ.get('BILI_META_CACHE', str(CACHE / 'meta')))
+META_CACHE_DIR = HOME / '.workbuddy' / 'cache' / 'bili' / 'meta'
 META_CACHE_TTL = 86400  # 秒；24h 内复用元信息缓存，避免队列阶段一/阶段二重复抓 view
 
 
@@ -393,6 +392,59 @@ def _setup_cuda_dlls():
                     except Exception:
                         pass
                 os.environ['PATH'] = d + os.pathsep + os.environ.get('PATH', '')
+
+
+def _prog():
+    """可选进度上报（由 BILI_PROGRESS_DIR 启用）。未启用或导入失败时返回 None。
+
+    进度是旁路：这里的任何问题都不允许影响转写主流程。
+    """
+    if not os.environ.get('BILI_PROGRESS_DIR'):
+        return None
+    try:
+        import progress_hub
+        return progress_hub
+    except Exception:
+        return None
+
+
+PROG_GROUP = 'B站转写'
+
+
+def _prog_boot(p, items, title='B站视频转录'):
+    """启用进度时：单实例拉起看板 + 写入任务清单。
+
+    - 看板已在跑就**只复用、不再开窗**（否则跑 20 条会弹 20 个窗口）
+    - 标题/时长走 24h 元信息缓存（队列先跑过 --meta-only 时是零请求）
+    - 全程尽力而为：任何异常都吞掉，绝不影响转写
+    """
+    try:
+        d = p.progress_dir()
+        if not d:
+            return None
+        os.environ.setdefault('BILI_PROGRESS_GROUP', PROG_GROUP)  # 子进程继承任务组
+        url = p.ensure_serving(d, open_window=True)
+        tasks = []
+        for it in items:
+            try:
+                _u, page, bv = resolve_input(it.get('url') or '')
+            except Exception:
+                continue
+            rec = {'id': bv, 'group': PROG_GROUP, 'engine': 'funasr-nano'}
+            try:
+                V = fetch_meta(it['url'], page)
+                rec['title'] = V.get('title')
+                rec['up'] = (V.get('owner') or {}).get('name')
+                rec['duration_sec'] = V.get('duration')
+            except Exception:
+                pass
+            tasks.append(rec)
+        if tasks:
+            p.init_run(tasks, title=title, d=d, group=PROG_GROUP,
+                       meta={'engine': 'funasr-nano'})
+        return url
+    except Exception:
+        return None
 
 
 def _load_model(model_size, device, compute, hf_mirror):
@@ -573,22 +625,47 @@ def merge_segments(segs, max_chars=90, max_gap=1.2, max_len=25.0):
 AD_KEYWORDS_FILE = Path(__file__).resolve().parent.parent / 'references' / 'ad_keywords.txt'
 
 
-def load_ad_keywords():
+def _read_ad_file():
+    """返回 (keywords, excludes)。以 ! 开头的行是排除短语，匹配前先从原文剥掉。"""
     if not AD_KEYWORDS_FILE.exists():
-        return []
-    out = []
+        return [], []
+    kws, exs = [], []
     for line in AD_KEYWORDS_FILE.read_text(encoding='utf-8').splitlines():
         s = line.strip()
-        if s and not s.startswith('#'):
-            out.append(s)
-    return out
+        if not s or s.startswith('#'):
+            continue
+        if s.startswith('!'):
+            t = s[1:].strip()
+            if t:
+                exs.append(t)
+        else:
+            kws.append(s)
+    return kws, exs
 
 
-def mark_ads(blocks, keywords):
-    """标记疑似广告段落。返回 (广告段落列表, 命中数)。blocks 原地加 is_ad / ad_hits。"""
+def load_ad_keywords():
+    return _read_ad_file()[0]
+
+
+def load_ad_excludes():
+    return _read_ad_file()[1]
+
+
+def mark_ads(blocks, keywords, excludes=None):
+    """标记疑似广告段落。返回 (广告段落列表, 命中数)。blocks 原地加 is_ad / ad_hits。
+
+    excludes 里的短语先从句子里剥掉再匹配，用于消解撞车词——词表只做子串匹配，
+    天然的泛义词（工商、广告、推广）会把产业叙述误标成带货。例：剥掉「工商银行」后，
+    「工商」不再命中银行名，避免把「超越工商银行」这类财经叙述打成广告。
+    """
+    excludes = excludes or []
     hits = []
     for b in blocks:
-        found = [k for k in keywords if k in b['text']]
+        text = b['text']
+        for e in excludes:
+            if e in text:
+                text = text.replace(e, '')
+        found = [k for k in keywords if k in text]
         b['ad_hits'] = found
         b['is_ad'] = bool(found)
         if found:
@@ -642,6 +719,21 @@ def process_video(a, url_arg, out_path, holder=None, preset=None):
     pages = V.get('pages') or [{'page': 1, 'cid': V['cid'], 'part': '', 'duration': V['duration']}]
     pinfo = next((x for x in pages if x['page'] == page), pages[0]) if page <= len(pages) else pages[0]
     cid = pinfo['cid']
+
+    # 单条模式：拿到元信息后立刻保证看板在跑并登记任务（单实例，已开则复用）
+    _pb = _prog()
+    if _pb:
+        try:
+            os.environ.setdefault('BILI_PROGRESS_GROUP', PROG_GROUP)
+            _pb.ensure_serving(_pb.progress_dir(), open_window=True)
+            _pb.init_run([{'id': bvid, 'title': V['title'],
+                           'up': V['owner']['name'],
+                           'duration_sec': pinfo.get('duration') or V['duration'],
+                           'engine': a.engine, 'group': PROG_GROUP}],
+                         title='B站视频转录', d=_pb.progress_dir(), group=PROG_GROUP,
+                         meta={'engine': a.engine})
+        except Exception:
+            pass
 
     L = ['# B站视频素材包（本地 ASR 转写）', '', '## 基本信息',
          f"- 标题：{V['title']}",
@@ -731,7 +823,7 @@ def process_video(a, url_arg, out_path, holder=None, preset=None):
                 asr_info['hotwords_status'] = meta.get('hotwords_status')
             blocks = merge_segments(segs)
             ad_kw = load_ad_keywords()
-            ad_hits, ad_count = mark_ads(blocks, ad_kw)
+            ad_hits, ad_count = mark_ads(blocks, ad_kw, load_ad_excludes())
             asr_info['ad_segments'] = ad_count
             route = f'asr:{a.engine}:{a.model if a.engine == "whisper" else meta.get("model")}@{meta["device"]}'
             L += ['', f"## 转写全文（{engine_label} · {meta['device']}）",
@@ -792,16 +884,28 @@ def main():
             # 再 append 成功项；上游队列按顺序 zip 回填，乱序会串台账。
             outcomes = []
             prepped = []
+            _p = _prog()
+            if _p:
+                _prog_boot(_p, items)
             for it in items:
+                _tid = _p.task_of(it.get('out') or it.get('url')) if _p else None
                 try:
                     url, page, _b = resolve_input(it['url'])
+                    if _p:
+                        _p.auto(task=_tid or _p.task_of(url), stage='download',
+                                note='下载音频…')
                     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
                     fp, _info = download_audio(url, AUDIO_DIR, COOKIE_HEADER, page,
                                                stem=f'{_b}_p{page}')
+                    if _p:
+                        _p.auto(task=_tid or _b, stage='convert',
+                                note='音频就绪，等待转写')
                     rec = {'url': it['url'], 'out': it['out'], 'audio': fp, 'error': None}
                     prepped.append(rec)
                     outcomes.append(rec)
                 except Exception as e:
+                    if _p:
+                        _p.auto(task=_tid, stage='fail', note='音频下载失败: ' + str(e)[:100])
                     outcomes.append({'url': it.get('url'), 'out': it.get('out'), 'audio': None,
                                      'error': str(e)})
             if prepped:
