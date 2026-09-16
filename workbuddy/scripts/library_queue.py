@@ -22,7 +22,7 @@
 行为:
   1. 读取台账全部记录
   2. 对「状态为空 / 待处理」的行解析 BV号
-  3. 查重：BV号 已出现在其它行 → 状态写「重复」并跳过，不再本地跑
+  3. 查重：BV号 已出现在其它行 → 直接跳过，不再本地跑（不写台账，台账没有该行也没关系）
   4. 未重复：补元信息 → 转写（可选）→ 回写字段与状态
   5. 素材包落 --cache-dir（默认 $BILI_CACHE_DIR 或 ~/.workbuddy/cache/bili），不进知识库
   6. AI 生成纪要后落 --raw-dir（默认 $BILI_RAW_DIR 或 ~/obsidian/raw），命名见 note_name()
@@ -30,7 +30,8 @@
   8. 台账回写攒批提交（每 20 条或结尾 flush）；回写失败项进 report.write_failed 并以非零退出
   9. 输出 JSON，processed[].note_name 给出标准纪要文件名
 
-状态列取值：待处理 / 已转写 / 已完成 / 失败 / 重复
+状态列取值：待处理 / 已转写 / 已完成 / 失败
+（2026-09-16 起重复项**不写台账**——该列实测无「重复」选项；历史数据若残留该值，仍按已处理识别）
 """
 import argparse
 import json
@@ -46,6 +47,14 @@ from pathlib import Path
 
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
+
+try:
+    import verify_pack          # 同目录脚本：素材包校验（归档前拦截）
+    _VP_IMPORT_ERROR = ""
+except ImportError as _e:       # 脚本被单独拷走等场景：允许降级，但必须显式声明（2026-09-16）
+    verify_pack = None
+    _VP_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+    # 只捕 ImportError：verify_pack 自身的 bug 应当照常冒泡，不再被静默吞掉
 
 # 路径从本文件推导 + 环境变量覆盖，避免写死机器相关路径
 SKILL_DIR = Path(__file__).resolve().parent
@@ -131,6 +140,64 @@ def extract_pubdate(md_path):
         return ''
     m = re.search(r'发布：(\d{4}-\d{2}-\d{2})', txt)
     return m.group(1) if m else ''
+
+
+def parse_pack_header(md_path):
+    """从素材包头部反解索引字段（标题 / UP主 / 发布日）。读不到返回空 dict。
+
+    素材包是事实源：「基本信息」在打包时就写好了这几个字段，因此索引缺行或字段不全时
+    可以自愈，不必要求人工补 index.json。
+    """
+    try:
+        txt = Path(md_path).read_text(encoding='utf-8', errors='replace')
+    except Exception:
+        return {}
+    out = {}
+    m = re.search(r'^- 标题：(.*)$', txt, re.M)
+    if m:
+        out['title'] = m.group(1).strip()
+    m = re.search(r'^- UP主：(.*?)（mid:', txt, re.M)   # UP主名里可能含括号，以「（mid:」为界
+    if m:
+        out['up'] = m.group(1).strip()
+    m = re.search(r'发布：(\d{4}-\d{2}-\d{2})', txt)
+    if m:
+        out['pubdate'] = m.group(1)
+    return {k: v for k, v in out.items() if v}
+
+
+def pack_candidates(cache_dir, bv, item=None):
+    """素材包可能的位置，按优先级：索引记录的路径 → 缓存目录 → 归档目录。"""
+    cands = [(item or {}).get('transcript', ''),
+             str(Path(cache_dir) / f'bili_{bv}.md'),
+             str(Path(cache_dir).parent / 'bili_subs' / f'bili_{bv}.md')]
+    return list(dict.fromkeys(c for c in cands if c))
+
+
+def heal_index(cache_dir, bv, idx=None):
+    """索引缺该 BV（或 pubdate/title/up 不全）时，从素材包反解补齐并写回索引。
+
+    返回 (item, healed)：healed 表示本次是否真的改写了索引。素材包找不到时返回原条目 +
+    False，由调用方决定报错还是继续——绝不静默编造字段。
+    transcript 一律留空：--finish 的归档逻辑会依次尝试 index 记录与默认路径，留空正好
+    落到实际文件上（填错反而更危险）。
+    """
+    idx = idx if idx is not None else load_index(cache_dir)
+    item = dict(idx.get(bv) or {})
+    if all(item.get(k) for k in ('pubdate', 'title', 'up')):
+        return item, False
+    for p in pack_candidates(cache_dir, bv, item):
+        got = parse_pack_header(p)
+        if not got:
+            continue
+        before = dict(item)
+        item.update(got)
+        item.setdefault('transcript', '')
+        if item != before:
+            idx[bv] = item
+            save_index(cache_dir, idx)
+            return item, True
+        return item, False
+    return item, False
 
 
 def lib_api(token, script, args):
@@ -254,17 +321,22 @@ def main():
 
     # 2.4 只查标准纪要文件名（不碰台账）
     if a.note_name:
-        idx = load_index(cache_dir)
-        item = idx.get(a.note_name.strip())
-        if not item:
-            print(json.dumps({'error': f'缓存索引里没有 {a.note_name}，'
-                                       f'请先转写或手工补 index.json'},
-                             ensure_ascii=False))
+        bv = a.note_name.strip()
+        # 索引缺行或字段不全 → 先从素材包反解补齐（直跑 --batch-file 不写索引，靠这里自愈）
+        item, healed = heal_index(cache_dir, bv)
+        lack = [k for k in ('pubdate', 'title', 'up') if not item.get(k)]
+        if lack:
+            print(json.dumps({'error': f'缓存索引里没有 {bv} 的完整信息'
+                                       f'（缺 {"/".join(lack)}），且未能从素材包反解补齐；'
+                                       f'请先转写或手工补 index.json',
+                              'searched': pack_candidates(cache_dir, bv, item),
+                              'index_healed': healed},
+                             ensure_ascii=False, indent=2))
             return
         name = note_name(item.get('pubdate', ''), item.get('title', ''),
                          item.get('up', ''))
-        print(json.dumps({'bvid': a.note_name.strip(), 'note_name': name,
-                          'note_path': str(raw_dir / name)},
+        print(json.dumps({'bvid': bv, 'note_name': name,
+                          'note_path': str(raw_dir / name), 'index_healed': healed},
                          ensure_ascii=False, indent=2))
         return
 
@@ -284,7 +356,8 @@ def main():
         archive_dir = cache_dir.parent / 'bili_subs'
         archive_dir.mkdir(parents=True, exist_ok=True)
         idx = load_index(cache_dir)
-        item = idx.get(want, {})
+        # 索引缺行或字段不全 → 从素材包反解补齐后再归档（素材包是事实源）
+        item, healed = heal_index(cache_dir, want, idx)
         dst = archive_dir / f'bili_{want}.md'
         errs = []
         archived = None
@@ -318,6 +391,23 @@ def main():
                              ensure_ascii=False, indent=2))
             return
 
+        # 归档前校验：素材包是误识修正的唯一依据，字段残缺不许闭环（新产物一律先过校验再归档）
+        vp_warnings = []
+        pack_check = "ok"
+        if verify_pack is not None:
+            vp_errors, vp_warnings, _vp = verify_pack.check_pack(archived)
+            if vp_errors:
+                print(json.dumps({'error': f'素材包校验未通过：{want}',
+                                  'pack_errors': vp_errors,
+                                  'hint': '请修复素材包后重跑 --finish；台账状态未改动'},
+                                 ensure_ascii=False, indent=2))
+                return
+        else:
+            # 降级必须显式可见：静默跳过校验等于让「归档前拦截」失效（2026-09-16 审查 P0-3）
+            pack_check = "skipped"
+            print(f"[警告] verify_pack 不可用（{_VP_IMPORT_ERROR}），本次归档未做素材包校验：{want}",
+                  file=sys.stderr)
+
         props = {'状态': {'select': ST_DONE}, '处理时间': {'date': today},
                  '素材包': {'text': archived}}
         if a.summary:
@@ -331,6 +421,9 @@ def main():
         update(a.token, a.database_id,
                [{'record_id': hits[0]['record_id'], 'properties': props}])
         print(json.dumps({'finished': want, 'archived': archived,
+                          'index_healed': healed,
+                          'pack_check': pack_check,
+                          'pack_warnings': vp_warnings,
                           'properties': props}, ensure_ascii=False, indent=2))
         return
 
@@ -399,18 +492,12 @@ def main():
         print(f'--- [{n}/{len(targets)}] {link}', file=sys.stderr)
 
         if bv and bv in handled:
-            rec = {
-                'record_id': rid,
-                'properties': {
-                    'BV号': {'text': bv},
-                    '状态': {'select': ST_DUP},
-                    '处理时间': {'date': today},
-                    '备注': {'text': '与已有记录重复，未重复处理'},
-                },
-            }
-            queue_update(rec)
-            report['duplicates'].append({'record_id': rid, 'bvid': bv, 'link': link})
-            print('    重复，已标记，跳过', file=sys.stderr)
+            # 命中重复 → 直接跳过，**不写台账**（2026-09-16 起）。
+            # 原因：① 台账「状态」列实测没有「重复」选项，写它会在回写时被拒；
+            #       ② 这条记录本就不在本次处理范围内，无需为它改状态或补行。
+            report['duplicates'].append({'record_id': rid, 'bvid': bv, 'link': link,
+                                         'dup_of': handled[bv]})
+            print('    重复，直接跳过（不写台账）', file=sys.stderr)
             continue
 
         try:

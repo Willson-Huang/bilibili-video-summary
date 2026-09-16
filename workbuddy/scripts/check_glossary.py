@@ -86,8 +86,15 @@ def iter_md(target):
     if p.is_file():
         yield p
         return
+    # SKIP_PARTS 只用于过滤「根目录之下新出现的」scripts/ references/ 等（2026-09-16 修正）。
+    # 历史行为：显式指定的根若命中 SKIP_PARTS（如 .workbuddy/cache/bili_subs），整个目录被静默
+    # 跳过并报「未发现命中」——假阴性会被误读成「没有错」。现在改为显式提醒后照常扫描。
+    root_skipped = SKIP_PARTS & set(p.parts)
+    if root_skipped:
+        print(f'[提醒] 扫描根路径含 {sorted(root_skipped)}（递归时本会跳过，因是你显式指定 → 照常扫描）: {p}',
+              file=sys.stderr)
     for f in sorted(p.rglob('*.md')):
-        if SKIP_PARTS & set(f.parts):
+        if SKIP_PARTS & set(f.relative_to(p).parts):
             continue
         yield f
 

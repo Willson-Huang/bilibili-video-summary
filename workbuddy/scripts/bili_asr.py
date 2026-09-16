@@ -674,6 +674,98 @@ def mark_ads(blocks, keywords, excludes=None):
     return hits, len(hits)
 
 
+# ---------------- 素材包组装（纯函数：无网络、无磁盘，便于单测）----------------
+def pack_head(V, bvid, cid, page, pages, pinfo, url):
+    """素材包开头：标题 / 基本信息 / 数据 / 简介 / 分P。"""
+    L = ['# B站视频素材包（本地 ASR 转写）', '', '## 基本信息',
+         f"- 标题：{V['title']}",
+         f"- BV号：{bvid} ｜ av号：{V['aid']} ｜ cid：{cid} ｜ 分P：{page}/{V.get('videos',1)}",
+         f"- UP主：{V['owner']['name']}（mid:{V['owner']['mid']}）",
+         f"- 发布：{fmt_date(V['pubdate'])} ｜ 时长：{fmt_dur(pinfo.get('duration') or V['duration'])}",
+         f"- 链接：{url}"]
+    st = V.get('stat') or {}
+    L.append(f"- 数据：播放 {st.get('view')} ｜ 点赞 {st.get('like')} ｜ 投币 {st.get('coin')} ｜ "
+             f"收藏 {st.get('favorite')} ｜ 评论 {st.get('reply')} ｜ 弹幕 {st.get('danmaku')}")
+    desc = '\n'.join(d['raw_text'] for d in (V.get('desc_v2') or [])) or V.get('desc', '')
+    if desc.strip() and desc.strip() != '-':
+        L += ['', '## 视频简介', desc.strip()]
+    if len(pages) > 1:
+        L += ['', '## 分P列表'] + [f"- P{p['page']} {p.get('part','')}（{fmt_dur(p.get('duration',0))})"
+                                   + ('  ← 当前' if p['page'] == page else '') for p in pages]
+    return L
+
+
+def pack_chapters(ch):
+    """UP主标记的章节；无章节返回空列表，便于直接 +=。"""
+    if not ch:
+        return []
+    return ['', '## 章节（UP主标记）'] + [f"- [{fmt_ts(c['from'])}] {c['content']}" for c in ch]
+
+
+def pack_subtitle(sub_text, sub_label):
+    """字幕直取全文（含来源标签）。"""
+    return ['', f'## 字幕全文（来源：{sub_label}）', '', sub_text]
+
+
+def pack_asr_note(logged_in, force_asr):
+    """字幕不可用时的说明行；显式 --force-asr 时不写。"""
+    if force_asr:
+        return []
+    if not logged_in:
+        return ['', '## 字幕',
+                '> 未配置登录凭据，B站 CC/AI 字幕接口不可用，已直接走本地 ASR 转写。']
+    return ['', '## 字幕', '> 该视频未开放字幕，已降级为本地 ASR 转写。']
+
+
+def pack_asr_body(engine_label, device, blocks, ad_hits, ad_count):
+    """本地 ASR 转写全文 + 疑似广告段落。"""
+    L = ['', f"## 转写全文（{engine_label} · {device}）",
+         '> 标注 `[广告?]` 的行为疑似带货口播，生成纪要时跳过，不写入结论。', '']
+    L += [f"[{fmt_ts(b['start'])}] {'[广告?] ' if b.get('is_ad') else ''}{b['text']}" for b in blocks]
+    if ad_hits:
+        L += ['', f'## 疑似广告段落（{ad_count} 段，生成纪要时跳过）', '']
+        L += ['| 时间戳 | 命中词 | 内容 |', '|---|---|---|']
+        L += [f"| {fmt_ts(h['start'])} | {'/'.join(h['keywords'])} | {h['text']} |" for h in ad_hits]
+    return L
+
+
+def pack_comments(rs):
+    """热门评论 Top20（仅作舆论参考）。"""
+    if not rs:
+        return []
+    L = ['', '## 热门评论 Top20']
+    for i, r in enumerate(rs, 1):
+        L.append(f"{i}. @{r['member']['uname']}（{r['like']}赞）："
+                 f"{r['content']['message'].replace(chr(10),' ')[:200]}")
+    return L
+
+
+def pack_meta(info):
+    """素材包的机器可读元信息块。
+
+    只记「产出侧、且无法从正文反推」的字段：路由 / 引擎 / 模型 / 设备 / 来源 / 时间戳粒度 /
+    热词指纹 / 音频时长。
+    刻意不写生成时间与墙钟耗时（下载/加载/转写秒数留在 stdout 与台账）——素材包必须由输入
+    唯一决定，否则「包文本哈希」就不能用来做格式回归。
+    """
+    def g(k):
+        v = info.get(k)
+        return '-' if v is None or v == '' else v
+
+    n, sha = info.get('hotwords_count'), info.get('hotwords_sha256')
+    hotwords = '-' if n is None else f"{n} 词 · sha256:{(sha or '-')[:16]}"
+    return ['', '## 元信息',
+            '> 机器可读的产出信息；生成纪要与增强条目时不要抄进正文。',
+            f"- route: {g('route')}",
+            f"- engine: {g('engine')}",
+            f"- model: {g('engine_model')}",
+            f"- device: {g('device')}",
+            f"- source: {g('source')}",
+            f"- ts_granularity: {g('ts_granularity')}",
+            f"- hotwords: {hotwords}",
+            f"- audio_sec: {g('audio_sec')}"]
+
+
 # ---------------- main ----------------
 def build_parser():
     ap = argparse.ArgumentParser()
@@ -735,29 +827,15 @@ def process_video(a, url_arg, out_path, holder=None, preset=None):
         except Exception:
             pass
 
-    L = ['# B站视频素材包（本地 ASR 转写）', '', '## 基本信息',
-         f"- 标题：{V['title']}",
-         f"- BV号：{bvid} ｜ av号：{V['aid']} ｜ cid：{cid} ｜ 分P：{page}/{V.get('videos',1)}",
-         f"- UP主：{V['owner']['name']}（mid:{V['owner']['mid']}）",
-         f"- 发布：{fmt_date(V['pubdate'])} ｜ 时长：{fmt_dur(pinfo.get('duration') or V['duration'])}",
-         f"- 链接：{url}"]
-    st = V.get('stat') or {}
-    L.append(f"- 数据：播放 {st.get('view')} ｜ 点赞 {st.get('like')} ｜ 投币 {st.get('coin')} ｜ "
-             f"收藏 {st.get('favorite')} ｜ 评论 {st.get('reply')} ｜ 弹幕 {st.get('danmaku')}")
-    desc = '\n'.join(d['raw_text'] for d in (V.get('desc_v2') or [])) or V.get('desc', '')
-    if desc.strip() and desc.strip() != '-':
-        L += ['', '## 视频简介', desc.strip()]
-    if len(pages) > 1:
-        L += ['', '## 分P列表'] + [f"- P{p['page']} {p.get('part','')}（{fmt_dur(p.get('duration',0))})"
-                                   + ('  ← 当前' if p['page'] == page else '') for p in pages]
+    L = pack_head(V, bvid, cid, page, pages, pinfo, url)
+    meta_at = len(L)          # 元信息块插在「基本信息」之后（值要到路由确定后才知道）
 
     # 预扫描模式（--only-meta）只取 view 接口信息：fetch_meta 已含标题/简介/分P/统计。
     # 不再请求 player(wbi) 与评论接口——省掉 /nav 与 reply 两个往返，判断"值不值得细看"够用。
     ch, subs = [], []
     if not a.only_meta:
         ch, subs = fetch_player(bvid, cid)
-        if ch:
-            L += ['', '## 章节（UP主标记）'] + [f"- [{fmt_ts(c['from'])}] {c['content']}" for c in ch]
+        L += pack_chapters(ch)
     meta_sec = round(time.time() - t_meta, 2)
 
     logged_in = 'SESSDATA=' in COOKIE_HEADER.upper()
@@ -770,17 +848,12 @@ def process_video(a, url_arg, out_path, holder=None, preset=None):
             sub_text, sub_label = fetch_subtitle_text(subs)
             if sub_text:
                 route = f'subtitle:{sub_label}'
-                L += ['', f'## 字幕全文（来源：{sub_label}）', '', sub_text]
+                L += pack_subtitle(sub_text, sub_label)
                 meta_sec += round(time.time() - t_sub, 2)
 
         # 路由 2：本地 ASR 转写
         if route is None:
-            if not a.force_asr and not logged_in:
-                L += ['', '## 字幕',
-                      '> 未配置登录凭据，B站 CC/AI 字幕接口不可用，已直接走本地 ASR 转写。']
-            elif not a.force_asr:
-                L += ['', '## 字幕',
-                      '> 该视频未开放字幕，已降级为本地 ASR 转写。']
+            L += pack_asr_note(logged_in, a.force_asr)
             if preset and preset.get('segments') is not None:
                 # 批量预转写：已下载并转写好的结果直接组装，不再下载/转写
                 segs = preset['segments']
@@ -826,15 +899,7 @@ def process_video(a, url_arg, out_path, holder=None, preset=None):
             ad_hits, ad_count = mark_ads(blocks, ad_kw, load_ad_excludes())
             asr_info['ad_segments'] = ad_count
             route = f'asr:{a.engine}:{a.model if a.engine == "whisper" else meta.get("model")}@{meta["device"]}'
-            L += ['', f"## 转写全文（{engine_label} · {meta['device']}）",
-                  '> 标注 `[广告?]` 的行为疑似带货口播，生成纪要时跳过，不写入结论。', '']
-            L += [f"[{fmt_ts(b['start'])}] {'[广告?] ' if b.get('is_ad') else ''}{b['text']}"
-                  for b in blocks]
-            if ad_hits:
-                L += ['', f'## 疑似广告段落（{ad_count} 段，生成纪要时跳过）', '']
-                L += ['| 时间戳 | 命中词 | 内容 |', '|---|---|---|']
-                L += [f"| {fmt_ts(h['start'])} | {'/'.join(h['keywords'])} | {h['text']} |"
-                      for h in ad_hits]
+            L += pack_asr_body(engine_label, meta['device'], blocks, ad_hits, ad_count)
             if not a.keep_audio:
                 try:
                     os.remove(fp)
@@ -843,11 +908,25 @@ def process_video(a, url_arg, out_path, holder=None, preset=None):
 
     if not a.only_meta and not a.no_comments:
         rs = fetch_comments(V['aid'])
-        if rs:
-            L += ['', '## 热门评论 Top20']
-            for i, r in enumerate(rs, 1):
-                L.append(f"{i}. @{r['member']['uname']}（{r['like']}赞）："
-                         f"{r['content']['message'].replace(chr(10),' ')[:200]}")
+        L += pack_comments(rs)
+
+    # 元信息块：值在路由确定后才齐全，此处回插到「基本信息」之后，保证开头即自描述
+    meta_info = {'route': route}
+    if route and route.startswith('subtitle:'):
+        meta_info.update(engine='subtitle', source=route.split('subtitle:', 1)[1],
+                         ts_granularity='cue')
+    elif asr_info:               # engine_label 由上面的本地 ASR 分支定义
+        meta_info.update(
+            engine=asr_info.get('engine'), engine_model=asr_info.get('engine_model'),
+            device=asr_info.get('device'), audio_sec=asr_info.get('audio_sec'),
+            source=engine_label,
+            ts_granularity=('segment(token)' if asr_info.get('engine') == 'funasr-nano'
+                            else 'segment'),
+            hotwords_count=asr_info.get('hotwords_count'),
+            hotwords_sha256=asr_info.get('hotwords_sha256'))
+    else:
+        meta_info.update(engine='meta-only')
+    L[meta_at:meta_at] = pack_meta(meta_info)
 
     text = '\n'.join(L)
     out = Path(out_path)
