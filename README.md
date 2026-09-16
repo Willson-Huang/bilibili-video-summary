@@ -9,13 +9,87 @@
 
 **把 B站视频，变成半年后还能搜到的知识笔记。**
 
-字幕直取（秒级）或本地双引擎转写（whisper 快约 20 倍 / Fun-ASR-Nano 中文专名更准）→ 专名纠错 + 广告过滤 → 固定 14 节结构化条目，经结构校验后交付。
+字幕直取（秒级）或本地双引擎转写（whisper 快约 20 倍 / Fun-ASR-Nano 中文专名更准）→ 专名纠错 + 广告过滤 → 固定 14 节结构化条目，经结构校验与素材包校验后交付。
 
-**EN** — Turn a Bilibili video into a knowledge note you can still search six months later: official subtitles in seconds, or local dual-engine ASR (whisper ≈20× faster, Fun-ASR-Nano far better on Chinese proper nouns), then proper-noun correction + ad filtering, and finally a fixed 14-section Markdown entry that must pass structure validation.
+**EN** — Turn a Bilibili video into a knowledge note you can still search six months later: official subtitles in seconds, or local dual-engine ASR (whisper ≈20× faster, Fun-ASR-Nano far better on Chinese proper nouns), then proper-noun correction + ad filtering, and finally a fixed 14-section Markdown entry that must pass structure and pack validation.
 
-[Releases](https://github.com/Willson-Huang/bilibili-video-summary/releases/latest) · [更新日志](#-更新日志最新在上) · [真实输出示例](examples/2025-07-25_哲学知识分享——熵增与熵减_荣格不吃炸鸡_纪要.md) · [快速开始](#-快速开始三选一) · [FAQ](#-faq)
+[Releases](https://github.com/Willson-Huang/bilibili-video-summary/releases/latest) · [🕳️ 避坑经验](#-避坑经验先看这个能省你几天) · [更新日志](#-更新日志最新在上) · [真实输出示例](examples/2025-07-25_哲学知识分享——熵增与熵减_荣格不吃炸鸡_纪要.md) · [快速开始](#-快速开始三选一) · [FAQ](#-faq)
 
 </div>
+
+---
+
+## 🕳️ 避坑经验（先看这个，能省你几天）
+
+> 下面每一条都是实测踩出来的。**被否决的路线同样是资产**——每条都附测试数据与具体样本，你不需要再花时间重跑一遍。
+> 完整数据、逐条实测与复现命令见 [`docs/避坑经验.md`](docs/避坑经验.md)。
+
+### 一、字幕 / 文字获取环节
+
+| 坑 | 现象 | 怎么做 |
+|---|---|---|
+| **B站 AI 字幕（`ai-zh`）是回译产物** | 中文 → 英文 → 中文，地名 / 人名 / 机构名成片偏移。实测「快递里的中国 · 广东惠州」一集里，惠州仲恺五镇「潼湖、潼侨、沥林、惠环、陈江」被写成「铜壶铜桥莅临汇环陈江」——**一句四错** | 只有人工 CC（`zh-CN`）可信；专名密集内容直接 `--force-asr --engine funasr-nano` |
+| 把「有字幕」当成「可信」 | 文档曾写「有 B站官方字幕 → 零识别错误，永远优先」——这只对人工 CC 成立 | 看**来源标识**，不看「有没有字幕」；AI 字幕也不能当验证基准 |
+| 想自动化取 Cookie | 三条路全断：Chrome 127+ 的 v20（App-Bound 加密）解不出、CDP 端口不可达、`SESSDATA` 带 `HttpOnly`（JS 读不到，能读到的恰好不含它） | 手动复制 `SESSDATA` 一次即可，别在这上面耗时间 |
+| 素材包被收尾流程删掉 | 修误识时发现 **32 条素材包已被 `--finish` 删除**，只能重跑一遍（等于重做转写） | 素材包是**误识修正的唯一依据**，现改为归档保留（`cache/bili_subs/`）；注意里面存在 `sub_BV*` / `bili_BV*` 两种前缀 |
+| 漏做查重，把已归档视频又转一遍 | `BV1KhTt63EJf`（39:10）被当成新视频完整转了一遍，而 14 节纪要早在 `raw/` 里 | 直跑脚本前先扫 `raw/*.md` 与 `cache/bili_subs/*BV*`，命中即终止 |
+
+### 二、音频转文字（ASR）环节
+
+- **引擎选择直接决定专名对错**：同一个 60s 样本，`whisper-large-v3-turbo` 专名正确 **2/11**，`Fun-ASR-Nano` **10/11**（肇庆 / 怀集 / 赵佶 / 利玛窦 全对 vs 全错）。**whisper 的错可能是高置信度错**（肇庆 → 赵庆），别只看置信度
+- **`initial_prompt` 救不了人名**：`宁德时代` 出现次数 23 → 36（提示词确实有偏置作用），但 `曾毓群` → 「曾玉群」照样错。音近替代是**声学层**错误，提示词只在**解码先验层**起作用——不存在「whisper 速度 + Nano 专名」的中间方案
+- **`BatchedInferencePipeline` 不要用**：转写快 2.05x，但凭空多出「请不吝点赞 订阅 转发 打赏支持明镜与点点栏目」这类幻觉，错别字也明显增多
+- **Nano 的 ~5x 实时是架构上限**：`batch_size`（1/4/8/16）、VAD 段长（30/60/120s）、砍热词、开双进程 **四组实测全部零收益**；且 `batch_size>1` 会引入解码非确定性。排期按 5x 算：10 小时音频约 2 小时
+- **两个引擎必须分 venv**：`funasr` 与 `faster-whisper` / `CTranslate2` 依赖冲突，绝不合并安装；Nano 走独立 venv + 子进程适配层
+- **Nano 遇到静音 / 无内容会产出空包**：要看 `timestamp_status`，`no_ts`（有正文但解析不出时间戳）与 `empty` 直接判失败——知识库依赖 `[hh:mm:ss]` 引用，无时间戳的素材包不许进流程
+- **Nano 的英文 token 会粘连**（如 `strangerstolove`）→ 英文歌 / 外语内容用 whisper 更稳；Nano 的语言参数保持 `auto`，**不要强制中文**
+- **热词既不是免费、也不必砍**：长视频每段都会重新注入热词，实测与不用热词同量级；默认 20–50 词、**硬上限 80**（再多会注意力稀释、误插词）
+
+### 三、已实测否决的路线（别再重跑）
+
+> ⚠️ 这一节最省时间。每条都有实测数据；它们**不是**「待验证的提速方案」，反复重试只会重复付出成本。
+
+| 方向 | 实测结果 | 结论 |
+|---|---|---|
+| 专名候选表（汇总标题 / 简介 / 章节里的专名） | 对 782 个真实错误，并集覆盖 **5.0%**；且这些文本本来就排在素材包最前部，下游打开就能看到 | 不做 |
+| 确定性规则层（拉丁字 / 数字规范化） | 涉及拉丁字或数字的错误里 **89.6% 是声学识别错误**（TCL → 「太刺」、ABB → 「APP」），规则无解；真实可修仅 **2.1%** | 不做 |
+| 批量修素材包里的空格粘连 | 素材包 **338 处**，而纪要 **0 处**（下游 LLM 生成时已自动修复） | 不做 |
+| 片内一致性纠错（同一实体按多数派改少数派） | 真实收益 **2.3%**（强口径）/ **4.4%**（弱口径）。人工漏改的往往正是**孤例**——没有第二处写法可对照，恰是这类方法的盲区 | 不做 |
+| 拼音候选层独立立项 | 词典直命中 **0%**（12 条词典与 787 个真实错误零重叠）；拼音只能生成候选，选不出正确答案 | 不独立立项 |
+| 速查表跨主题扫描 | 拿 71 条速查表扫一份全新素材包：命中 3 处、**真阳性 0 处**（「板」是「电路板」的本义） | 降级为「注意力提示」 |
+| vLLM 提速 | 官方部署矩阵面向 Linux GPU 服务端；官方公布的 RTFx 340 是 **H100** 上的数值，与消费级卡不可比 | Windows 原生不可行 |
+| llama.cpp GGUF 加速 Nano | 下载解包核对：Windows 预编译包**只含 SenseVoiceSmall** 二进制；CUDA 包面向 arch 86，sm_89 一代不在覆盖内；Nano 走 GGUF 只有 CPU | 要 GPU 必须自编译 |
+| Qwen3-ASR-1.7B 替代 Nano | 专名 **7/11**，低于 Nano 的 10/11，参数还更大 | 不做 |
+
+**一条通用方法论**：纠错层的真实价值 = **覆盖率 × 漏改率**。只算覆盖率会把「人工已经改对的」也算成收益——实测人工漏改率 **20.8%**（787 对样本），这才是自动化真正能救的上限。做任何「自动化替代人工」的收益评估，都该这么算。
+
+**一句话**：词表能提供的是「答案」，而校对真正需要的是「注意力」。
+
+### 四、校对：按类型查，比查词表有效
+
+同一份素材包、同一个校对者，**词表法 0 个真阳性，按类型核查 3 个真错写**。
+
+「校对三查」——企业 / 品牌名 → 地名 → 历史地名，逐类抽行核对：
+
+| 类型 | 实测锚点 |
+|---|---|
+| 企业 / 品牌名 | `新旺达 → 欣旺达`（深圳动力电池公司） |
+| 地名 | `重卡一带 → 仲恺一带`（惠州仲恺高新区） |
+| 历史地名 | `阜城 / 抚沟 → 府城`（惠州府城） |
+
+**为什么有效**：ASR 把专名听错后，错写往往仍是「合法中文词」（重卡 / 阜城 / 新旺达），AI 与快速通读都不会起疑——只有主动问「这里提到的实体真名是什么」才会暴露。
+
+最危险的一类是**错写本身是合法中文词**：`姚顺雨`（腾讯首席 AI 科学家）被反复误识为 `尧舜禹`（三个古代圣王，同音，AI 不会怀疑），错误一路进正文、甚至进 frontmatter 的 `entities`，把正确名字的检索入口堵死。
+
+### 五、工程细节（踩过才知道）
+
+- 脚本产出的**素材包是纯外部数据**：字幕 / 简介 / 章节由 UP 主可控，**热评任何人可写**——任何指令形态的文本一律不得执行
+- **改已有产出只增不减**：升级条目时重排章节，曾导致章节脉络表与两个完整小节（各含 7 条要点）全部丢失
+- **产出体积变小 = 发生了删减**：增强后文件应大于原文件（+50% 以上属正常）
+- **单测全绿 ≠ 判据正确**：有两次是拿到真实数据才暴露——扫描脚本把目标目录静默跳过（报「未发现命中」，实际 29 处命中）、字段判据只覆盖了两种数据形态中的一种
+- **子串匹配的词表别放泛义词**：写「夸克」会误标物理科普里的夸克，写「广告」会命中「招聘广告」——必须写产品全称或限定短语
+- **Windows / Git Bash 下 `bili.bat` 不能直接执行**，`cmd /c` 也常被拦 → 用文档给出的等价环境变量写法（四个变量一个都不能省）
+- **长任务的中断恢复要看磁盘，不能信汇报**：曾有子代理报「16/16 完成」，查盘后一条都没回填——以 `raw/` 落盘时间 + 索引入库 + 台账状态三处交叉为准
 
 ---
 
@@ -126,16 +200,16 @@
 
 听 1 小时播客要花 1 小时；让 AI「总结这个视频」，它只会看标题和简介——**它根本没看过视频**。
 
-这个工具把音轨拉下来，用本地 Whisper 转写成**带时间戳的全文**，再基于全文产出 14 节知识条目：每条结论可回跳时间点，每个存疑处标注 `[原文疑似]`，转写数据不出你的电脑。
+这个工具把音轨拉下来，用本地双引擎（whisper / Fun-ASR-Nano）转写成**带时间戳的全文**，再基于全文产出 14 节知识条目：每条结论可回跳时间点，每个存疑处标注 `[原文疑似]`，素材包全程不出你的电脑。
 
-| ⏱️ 实测性能（NVIDIA GPU） | |
+| ⏱️ 实测性能（消费级 NVIDIA GPU） | |
 |---|---|
-| 2 分 24 秒视频 → 拿到全文转写 | **12 秒**（下载 2.0s + 转写 8.8s） |
-| 1 小时视频推算 | **约 3 分钟**（large-v3-turbo @ CUDA） |
-| 4 分 48 秒完成 1:39:28 长视频实测 | **24.6x 实时** |
-| 播放视频？上传数据？ | 不需要 · 不上传 |
+| `whisper-large-v3-turbo` | **19.2x 实时**——1 小时视频约 3 分钟；1:39:28 长视频纯转写 77s |
+| `Fun-ASR-Nano`（中文专名更准，见下） | **5.1x 实时**——排期按 5x 算，10 小时音频约 2 小时（冷启动 48–52s，批量只付一次） |
+| 2 分 24 秒视频 → 拿到全文转写 | **12 秒**（下载 2.0s + 转写 8.8s，模型已缓存） |
+| 播放视频？上传数据？ | 无需播放；**素材包不出本机**（纪要副本可选上传到你自己的知识库） |
 
-> 上表为真实运行记录（`BV1habQzWEzq`，turbo @ CUDA，模型已缓存）。**首次运行**会额外下载 Whisper 模型（约 1.5 GB，一次性的），之后走本地缓存。
+> 上表为真实运行记录（`BV1habQzWEzq`，turbo @ CUDA，模型已缓存）；两个引擎的倍率为同机对照实测。**首次运行**会额外下载 Whisper 模型（约 1.5 GB，一次性的），之后走本地缓存；Fun-ASR-Nano 模型需另行下载。
 
 ## 它是怎么工作的
 
@@ -152,7 +226,7 @@ graph LR
     G --> H
     H --> I["专名纠错表 + 广告过滤"]
     I --> J["14节知识库条目"]
-    J --> K["结构校验 verify_structure"]
+    J --> K["校验 结构 verify_structure / 素材包 verify_pack"]
 ```
 
 **三条路径怎么走**：
@@ -161,7 +235,7 @@ graph LR
 |---|---|
 | **字幕直取** | 配置 B站 Cookie 后直接拉取字幕（秒级）；无字幕或未配置 Cookie 时自动降级为本地转写。音轨下载后不转码、转写完即删。⚠️ **"有字幕"不等于可信**：`zh-CN` = 人工 CC（可信，可作核对基准）；`ai-zh` = B站 AI 生成，**经中文 → 英文 → 中文回译**，地名人名偏差大，**不可作验证基准**——专名密集内容建议 `--force-asr` 走本地 `funasr-nano` |
 | **引擎路由** | 无字幕时按 `UP主白名单 → 视频 tag → 关键词打分` 选引擎（`--only-meta --classify` 给出建议）：`whisper` 快约 20 倍，`Fun-ASR-Nano` 中文专名更准（实测 10/11 vs 2/11）；灰区一律判 whisper |
-| **纠错与校验** | `asr_glossary.txt` 强制纠正"看起来没毛病的合法中文词"类误识；产出必须过 `verify_structure.py` 四项硬拦截（frontmatter / tags·entities 数量 / 14 节齐全 / 要点表格化）|
+| **纠错与校验** | `asr_glossary.txt` 强制纠正"看起来没毛病的合法中文词"类误识；纪要产出必须过 `verify_structure.py` 四项硬拦截（frontmatter / tags·entities 数量 / 14 节齐全 / 要点表格化）；素材包在归档前还要过 `verify_pack.py` 五组校验，不合格就拒绝闭环 |
 
 ## 📊 进度看板（Mission Control）
 
@@ -196,6 +270,7 @@ python scripts/progress_hub.py --demo --dir <运行目录> && python scripts/pro
 2. 安装依赖：`pip install -r portable/requirements.txt`
 3. 把 `portable/SKILL.md` **全文**作为指令导入：Claude Projects / Cursor Rules / GPTs Instructions
 4. 之后对 AI 说：*「总结这个视频 https://www.bilibili.com/video/BVxxxx」* 即可
+5. 想用中文专名更强的 **Fun-ASR-Nano**（可选）：见 `portable/SKILL.md` 的「第二引擎」安装说明——它跑在**独立的 venv** 里（`funasr` 与 `faster-whisper` 依赖冲突，**不能装进同一个环境**）
 
 </details>
 
@@ -206,6 +281,7 @@ python scripts/progress_hub.py --demo --dir <运行目录> && python scripts/pro
 2. 解压，把 `bilibili-video-summary/` **整个文件夹**放进 `~/.workbuddy/skills/`
 3. 重启 WorkBuddy，直接发 B站链接
 4. 首次使用前装转写环境：`pip install faster-whisper yt-dlp imageio-ffmpeg`（详见 Release Notes）
+5. 想用中文专名更强的 **Fun-ASR-Nano**（可选）：按 `workbuddy/SKILL.md` 的安装说明，在**独立 venv** 里装（`pip install --no-deps funasr` + 手动装 numpy 2.x），再用 `BILI_PYTHON_NANO` 指向它
 
 </details>
 
@@ -230,6 +306,8 @@ python tests/test_core.py
 
 一段 2 分 24 秒的科普短视频（《熵增与熵减》），完整真实产出见
 [examples/2025-07-25_哲学知识分享——熵增与熵减_荣格不吃炸鸡_纪要.md](examples/2025-07-25_哲学知识分享——熵增与熵减_荣格不吃炸鸡_纪要.md)：
+
+> 📌 该示例是早期版本产出：它的「实体」章节仍是单表结构，当前模板已细分为人物 / 产品 / 模型三张子表——以 [`portable/references/knowledge-entry-template.md`](portable/references/knowledge-entry-template.md) 为准。
 
 > **版权说明**：示例纪要基于上述 UP主的公开视频由本工具自动整理，仅供演示输出格式与个人学习使用；视频内容及音轨版权归原 UP主所有。如权利人要求删除或调整，请提 [Issue](https://github.com/Willson-Huang/bilibili-video-summary/issues) 或联系仓库所有者，将在 24 小时内处理。
 
@@ -313,11 +391,42 @@ AI 平台看不到视频内容，只能基于标题/简介/评论猜。本工具
 
 </details>
 
-## 🔒 隐私：数据不出本机
+<details>
+<summary>Fun-ASR-Nano 怎么装？能和 whisper 装在一起吗？</summary>
 
-- 音轨下载、Whisper 转写、纪要生成**全程在本地完成**，无任何云端调用；Whisper 模型从 HuggingFace 镜像一次性下载后离线使用
-- B站登录 Cookie 只存本地文件（`~/.cache/bilibili-video-summary/.bilibili_cookie`），已被 `.gitignore` 排除，**永远不会进仓库**
-- 本仓库发布前做过脱敏审计：无绝对路径、无私有资源 ID、无真实用户数据；脚本与文档中的敏感值全部改为环境变量（`BILI_PYTHON` / `BILI_CACHE` / `BILI_COOKIE` 等）
+**不能装一起**——`funasr` 与 `faster-whisper` / `CTranslate2` 依赖冲突。做法是另建一个 venv，在其中 `pip install --no-deps funasr` 并手动装 numpy 2.x（funasr 自带的 `numpy<2` 约束在 Python 3.13 下已过时），再把环境变量 `BILI_PYTHON_NANO` 指向那个解释器。主脚本会自动经 `funasr_adapter.py` 子进程调用，**不需要手动切环境**。
+
+什么时候用它：中文专名密集的内容（历史 / 地理 / 政经 / 人物）。代价是慢约 4 倍（5.1x vs 19.2x 实时）。
+
+</details>
+
+<details>
+<summary>转写把专名听错了，怎么校对？</summary>
+
+**别指望词表——按类型逐类核查更有效**（实测同一份素材包：词表法 0 个真阳性，按类型核查 3 个真错写）。
+
+「校对三查」：把素材包正文里 ① 企业 / 品牌名 ② 地名 ③ 历史地名 逐类抽出来，逐个问「这家单位 / 这个地方的真名是什么」。错写往往仍是合法中文词（重卡 → 仲恺、阜城 → 府城、新旺达 → 欣旺达），通读时不会起疑，只有主动核对才会暴露。
+
+细节与实测数据见 [🕳️ 避坑经验](#-避坑经验先看这个能省你几天)。
+
+</details>
+
+## 🔒 隐私与数据流向
+
+先看清**什么出本机、什么不出**：
+
+| 数据 | 去向 | 是否出本机 |
+|---|---|---|
+| 素材包（含第三方字幕全文与评论） | 本地 `cache/bili_subs/` | **否** |
+| 纪要 / 知识条目 | 你的本地知识库目录 | **否** |
+| 纪要副本 | 你配置的云端知识库（可选步骤） | **是**——上传即出本机 |
+| 队列元信息（BV号 / 标题 / UP主 / 状态） | 在线表格（仅 WorkBuddy 队列模式） | **是** |
+
+> 所以「全程本地」只在**素材包**这一层成立。不配云端知识库、不用在线表队列时，转写与产物确实不出本机——对外说明时别一概讲「不上云」。
+
+- 音轨下载与 ASR 转写（含双引擎）**全部在本地完成**，无云端推断；Whisper 模型从 HuggingFace 镜像一次性下载后离线使用
+- B站登录 Cookie 只存本地文件（便携版 `~/.cache/bilibili-video-summary/.bilibili_cookie`，WorkBuddy 版 `~/.workbuddy/.bilibili_cookie`），已被 `.gitignore` 排除，**永远不会进仓库**
+- 仓库发布前做过脱敏审计：无绝对路径、无私有资源 ID、无真实用户数据；脚本与文档中的敏感值全部改为环境变量（`BILI_PYTHON` / `BILI_CACHE` / `BILI_COOKIE` 等）
 
 ## 两个版本
 
@@ -330,22 +439,33 @@ AI 平台看不到视频内容，只能基于标题/简介/评论猜。本工具
 
 ```
 bilibili-video-summary/
-├── docs/                # 文档配图（进度看板预览图）
+├── docs/                # 文档配图 + 避坑经验完整版
 ├── examples/            # 真实产出示例（本工具自己生成的 14 节纪要）
-├── workbuddy/           # WorkBuddy 原版（SKILL.md + scripts + references + tests）
+├── workbuddy/           # WorkBuddy 原版（另含在线表队列 library_queue.py、
+│                        #   IMA 上传 ima_cos_upload.py、错误基线体检 baseline_errors.py）
 └── portable/            # 便携版（无平台依赖）
     ├── SKILL.md         # 完整指令——导入 AI 平台的就是它
     ├── requirements.txt
-    ├── scripts/         # bili_asr.py / process_queue.py / bili.mjs / bili_wbi.py|mjs ...
-    │                    #   funasr_adapter.py 第二引擎（Fun-ASR-Nano）适配层
-    │                    #   progress_hub.py + dashboard.html + bili_dashboard.bat 进度看板
-    │                    #   check_glossary.py 专名纠错复核 · verify_structure.py 结构校验
-    │                    #   verify_coverage.py 覆盖校验 · chrome_cookie_export.py Cookie 导出
-    │                    #   verify_pack.py 素材包校验（归档前拦截）
-    ├── references/      # 知识条目模板 / 广告过滤词表
-    │                    #   asr_glossary.txt 专名误识对照表
-    │                    #   engine_up_whitelist.txt + engine_verify_log.txt（模板）
-    │                    #   perf-benchmark-*.md 引擎速度基准原始数据
+    ├── scripts/
+    │   ├── bili_asr.py              主脚本：链接解析 → 字幕直取 / 本地 ASR → 素材包
+    │   ├── funasr_adapter.py        第二引擎（Fun-ASR-Nano）子进程适配层
+    │   ├── process_queue.py         本地 CSV 队列
+    │   ├── search_bili.py           按关键词搜视频
+    │   ├── bili.mjs · bili_wbi.py|mjs · set-cookie.mjs    Node 侧入口与 WBI 签名
+    │   ├── progress_hub.py · dashboard.html · bili_dashboard.bat   进度看板
+    │   ├── verify_structure.py      纪要结构校验（四项硬拦截）
+    │   ├── verify_pack.py           素材包校验（归档前拦截）
+    │   ├── verify_coverage.py       增强前后覆盖比对
+    │   ├── check_glossary.py        专名纠错复核
+    │   └── chrome_cookie_export.py  Cookie 导出（v10/v11 可解，v20 需手动）
+    ├── references/
+    │   ├── knowledge-entry-template.md      14 节知识条目模板
+    │   ├── ad_keywords.txt                  广告过滤词表
+    │   ├── asr_glossary.txt                 专名误识强制纠正表
+    │   ├── 专名误识速查-主题组.txt           人工校对提示（只适合同主题视频）
+    │   ├── engine_up_whitelist.txt · engine_verify_log.txt   引擎路由白名单（模板）
+    │   ├── perf-benchmark-2026-09-13.md     引擎速度基准原始数据
+    │   └── progress-hub-design.md           看板设计与实现说明
     └── tests/           # Python 自测 + 看板前端 JS 回归测试
 ```
 
@@ -354,7 +474,7 @@ bilibili-video-summary/
 - 视频内容的版权归原作者所有；本工具仅作个人学习与知识整理用途，请勿批量抓取或分发他人内容
 - **不得用于下载、绕过或分发付费 / 大会员专属内容**；配置 Cookie 仅用于访问你本人账号有权查看的内容（字幕直取 / 高码率音源）
 - 公开发布由本工具生成的条目时，请附视频链接与版权归属说明（模板「使用规则」已内置此要求）
-- 模型缓存：`~/.cache/bilibili-video-summary/models/whisper`（便携版）或 `~/.workbuddy/models/whisper`（WorkBuddy 版）
+- 模型缓存：whisper 在 `~/.cache/bilibili-video-summary/models/whisper`（便携版）或 `~/.workbuddy/models/whisper`（WorkBuddy 版）；Fun-ASR-Nano 的模型由 funasr 自行管理，落在它自己的缓存目录
 - 转写是口播内容，含口语重复与 ASR 错字；产出中疑问处一律标注 `[原文疑似]`
 
 ---
