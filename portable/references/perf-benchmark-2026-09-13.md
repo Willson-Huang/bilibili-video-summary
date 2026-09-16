@@ -7,7 +7,7 @@
 
 | 项 | 值 |
 |---|---|
-| GPU | NVIDIA GPU（8 GB 显存，消费级） |
+| GPU | NVIDIA RTX 4060 Ti 8GB |
 | 引擎 A | faster-whisper `large-v3-turbo`（CTranslate2, float16） |
 | 引擎 B | Fun-ASR-Nano-2512（800M，funasr 1.4.14，独立 venv `asr_eval`） |
 | torch | 2.6.0+cu124 ／ Python 3.13.14 |
@@ -100,7 +100,7 @@ batch=16 才与 batch=1 完全一致——存在解码非确定性。**用参数
 
 ## 5. 结论与排期
 
-1. **Nano 的 ~5x 是架构上限**：800M 自回归解码，单进程即打满 GPU。调用参数、分段策略、
+1. **Nano 的 ~5x 是架构上限**：800M 自回归解码，单进程即打满 RTX 4060 Ti（8 GB）。调用参数、分段策略、
    并发都动不了。要更快只能换硬件（更大显存才有意义）或换推理后端（如 vLLM，未验证）。
 2. **排期按 5x 算**：10 小时音频 ≈ 2 小时。模型冷启动 48–52s，但**批量只付一次**——
    批量务必走 `--batch-file` / `library_queue.py`，不要逐条调用。

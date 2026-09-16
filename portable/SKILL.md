@@ -442,7 +442,7 @@ python scripts/verify_coverage.py "<原文件>" "<新文件>"
 
 ---
 
-## 实测性能（NVIDIA GPU，仅参考）
+## 实测性能（NVIDIA RTX 4060 Ti 8GB，仅参考）
 
 11:30 视频 = 689.7s 音频，turbo @ CUDA：
 

@@ -42,7 +42,7 @@ cd <工作区>
 | Python | `~/.workbuddy/binaries/python/envs/whisper/Scripts/python.exe` |
 | 主脚本 | `scripts/bili_asr.py` |
 | 模型缓存 | `~/.workbuddy/models/whisper`（medium / large-v3 / large-v3-turbo 已就绪） |
-| 硬件 | NVIDIA GPU → CUDA 加速 |
+| 硬件 | NVIDIA RTX 4060 Ti 8GB（CUDA 加速） |
 | 配套脚本 | `bili.mjs`（Node 轻量替代）、`search_bili.py`（按关键词搜视频）、`verify_coverage.py`（覆盖校验） |
 | 参考模板 | `references/knowledge-entry-template.md` |
 
@@ -152,7 +152,7 @@ bili.bat "<链接>" --model large-v3-turbo --out ".workbuddy/cache/bili/bili_<BV
 
 > **我该什么时候切**：见下一节 3c「AI 侧自动切换规则」——脚本不会自动切，由接收任务时按 UP主白名单/标题关键词判断并显式带 `--engine`。
 
-**速度（NVIDIA GPU 8GB，2026-09-13 复测定稿）**：
+**速度（NVIDIA RTX 4060 Ti 8GB，2026-09-13 复测定稿）**：
 
 | 场景 | 实测 |
 |---|---|
@@ -884,7 +884,7 @@ PYTHONPATH= ~/.workbuddy/binaries/python/envs/whisper/Scripts/python.exe \
 
 ---
 
-## 实测性能（NVIDIA GPU 参考）
+## 实测性能（NVIDIA RTX 4060 Ti 8GB 参考）
 
 11:30 视频 = 689.7s 音频，turbo @ CUDA：
 
@@ -942,7 +942,7 @@ yt-dlp 直接落 B站原生 m4a(AAC)，PyAV 可直接解码，省掉 ffmpeg 转�
 | 降低 `beam_size`（5→1/2/3） | **不做** | 调参收益要拿同段音频逐档比误识率才知道，属"测了才值不值"。已有 `BatchedInferencePipeline` 拿速度换质量的翻车教训（幻觉+错字），说明本场景对转写质量敏感。真出现术语密集、误识率高的长视频时按需临时用 `large-v3`，而不是全局调解码参数 |
 | 音频降码率（yt-dlp 改低码率格式） | **不做** | 下载环节实测仅 2.5s/条，降到 96–128kbps 省不了多少时间；且 B 站部分视频只有单一音轨，格式筛选可能取不到音频导致失败。省时间要从 GPU 侧找，不是网络侧 |
 | 并行下载 + 单 GPU 转写流水线 | **不做** | 实测下载 2.5s（短视频）/ 44s（1:39 长视频），转写 33.7s/条。串行时 GPU 只在长视频下载期空等，短视频批量收益极小；复杂度高（多线程队列 + 失败重试 + 磁盘清理），与收益不成比例。批量已做到"整批只加载一次模型"，先吃下这个就够了 |
-| Nano 侧调 `batch_size` / VAD 段长 / 砍热词 / 开双进程 | **不做** | 2026-09-13 四组实测全部零收益（数字见 3b「速度」表）。Nano 是 800M 自回归解码，单进程即把 GPU 吃满；速度上限由模型架构决定，不在调用参数上 |
+| Nano 侧调 `batch_size` / VAD 段长 / 砍热词 / 开双进程 | **不做** | 2026-09-13 四组实测全部零收益（数字见 3b「速度」表）。Nano 是 800M 自回归解码，单进程即把 RTX 4060 Ti（8 GB）吃满；速度上限由模型架构决定，不在调用参数上 |
 | 给 whisper 加 `initial_prompt` 专名列表换 Nano 级专名 | **不做** | 实测提示词只影响解码先验：`宁德时代` 23→36 有效，但 `曾毓群`→「曾玉群」照样错。音近替代是声学层错误，提示词压不住（详见 3b 负结果） |
 | Qwen3-ASR-1.7B 替代 Nano | **不做** | 2026-09-06 实测专名 7/11，低于 Nano 的 10/11，且参数量 1.7B 更大——慢且更不准，无替换价值 |
 
