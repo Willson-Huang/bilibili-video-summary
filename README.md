@@ -51,7 +51,8 @@
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
-| **[v2.6.7](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.7)** | 2026-09-19 | 进度看板上报默认开启 · AI 字幕定性订正 · 多语种与批量排期实测回流 |
+| **[v2.6.8](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.8)** | 2026-09-19 | 修复 `--prompt` 泄漏成正文 · 便携版补齐实测坑 · AI 字幕口径全仓订正 |
+| [v2.6.7](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.7) | 2026-09-19 | 进度看板上报默认开启 · AI 字幕定性订正 · 多语种与批量排期实测回流 |
 | [v2.6.6](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.6) | 2026-09-16 | 素材包校验与自描述 · 不可信输入防御 · 查重语义收敛（含 v2.6.1–v2.6.5 的迭代） |
 | [v2.6.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.0) | 2026-09-16 | 进度看板子系统（零依赖独立窗口）· 引擎速度基准 · 队列 `--force-asr` 透传 |
 | [v2.5.2](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.5.2) | 2026-09-10 | 文档修正：AI 字幕经回译、专名不可信（含路由与验证基准的使用边界） |
@@ -59,7 +60,17 @@
 | [v2.2.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.2.0) | 2026-09-05 | 结构校验 · Cookie 自动导出 · 队列按 UP主 过滤 · 合规加固 |
 | [v2.1.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.1.0) | 2026-08-30 | 首次发布：WorkBuddy 原版 + 跨平台便携版 |
 
-### v2.6.7 — 2026-09-19　[Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.7)
+### v2.6.8 — 2026-09-19　[Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.8)
+
+- **修掉一处会污染纪要的静默缺陷**：默认 `--prompt` 会被 whisper 当成前文上下文**续写出来**，成为素材包第一段假正文 —— `[00:00:00] 请使用正确的中文标点符号。`。它随后被当成真实内容写进纪要，而素材包外观上完全看不出来。本机 128 份历史素材包 0 份命中（低频），但已实测复现
+  - 修法**不动默认值**（它承担中文先验：简体 + 标点），改在转写之后加清洗层：新增 `strip_prompt_leak()` 按 prompt 分句反复剥离开头伪正文段，剥空则整段丢弃；只清开头、不误伤正文；另覆盖「整段是 prompt 连续子串」的截断续写形态
+  - 结果 JSON 增 `asr.prompt_leak` 字段记录剥离段数，可持续观察这类泄漏的实际发生率
+  - 新增 10 条单测。开发中由单测抓到一个会崩的真实缺陷：初始化原在「下载音频」分支内，而**批量预转写分支跳过下载与转写直接组装素材包**，走那条路会抛 `UnboundLocalError` —— 已上提到两条路径的共同入口
+- **便携版补齐与平台无关的实测方法**（此前缺整节）：长片字幕轨规律（跟时长强相关、与充电专属无关）、内嵌硬字幕查法、三个实测坑（`videoshot` 时间戳约 +5s 偏移 / `index` 间歇返回空数组 / 画面内嵌字幕只能作语义级基准）；并修正一处**失效链接**（原指向 `../workbuddy/SKILL.md`，便携包内不含该文件）
+- **AI 字幕口径全仓订正**：`ai-zh` 是原声中文 ASR 轨、不是回译 —— 上一轮只扫了 `*.md`，本轮补扫 `.txt` / `.py`，订正 `engine_verify_log.txt`、`bili_asr.py` docstring、`library_queue.py` 三处遗留旧表述
+
+<details>
+<summary><b>v2.6.7 — 2026-09-19</b>　进度看板上报默认开启 · AI 字幕定性订正 · 多语种与批量排期实测回流（点击展开）</summary>
 
 - **进度看板上报默认开启**（修一处「文档与实现相反」）：看板此前只在环境变量已设时才上报，未设置时上报链路在第一步就静默返回，而文档写的是「默认开启」——两者相反，且全程吞异常，**不报错、不留日志**，从外部完全看不出被跳过
   - `bili_asr.py` 新增运行目录推导：未配置时从当前项目向上找含 `.workbuddy` 的目录，取其下的 `cache/progress/current`；只做默认值填充，不覆盖显式配置
@@ -72,6 +83,8 @@
 - **有 AI 字幕时的双源做法**：需要可追溯的内容，把字幕包另存为旁证、再用本地转写覆写主包
 - **`[广告?]` 标记的真实形态**：它在行内、不在行首；按行首检索会得到 0 命中并误判「正文没有标记」
 - 硬件型号按约定写明（`NVIDIA RTX 4060 Ti 8GB`）——复现速度数据需要它
+
+</details>
 
 <details>
 <summary><b>v2.6.6 — 2026-09-16</b>　素材包校验与自描述 · 不可信输入防御 · 查重语义收敛（点击展开）</summary>
