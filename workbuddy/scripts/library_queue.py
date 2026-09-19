@@ -11,7 +11,7 @@
                                                               中文专名密集批次改用 Nano 引擎（不传则 whisper）
   python library_queue.py --token <op_token> --engine funasr-nano --force-asr
                                                               专名密集批次强制跳过字幕走本地 ASR
-                                                              （B站 AI 字幕经中英回译，专名不可信）
+                                                              （B站 AI 字幕是原声中文 ASR 轨，专名同样不可信）
   python library_queue.py --token <op_token> --database-id <id>
   python library_queue.py --token <op_token> --raw-dir <path>      纪要落盘目录
   python library_queue.py --token <op_token> --cache-dir <path>    素材包缓存目录
@@ -211,7 +211,7 @@ def lib_api(token, script, args):
 
 
 def engine_args(a):
-    """把 --engine / --hotwords / --force-asr 透传给 bili_asr.py（避免队列悄悄跑回 whisper 或吃回译字幕）"""
+    """把 --engine / --hotwords / --force-asr 透传给 bili_asr.py（避免队列悄悄跑回 whisper 或吃下专名不可信的 AI 字幕）"""
     out = []
     if getattr(a, 'engine', 'whisper') and a.engine != 'whisper':
         out += ['--engine', a.engine]
@@ -293,7 +293,7 @@ def main():
     ap.add_argument('--hotwords', default=None, help='热词文件路径，透传给 bili_asr.py（仅 Nano 生效）')
     ap.add_argument('--force-asr', action='store_true',
                     help='透传给 bili_asr.py：强制跳过字幕直取走本地 ASR。'
-                         '专名密集内容（历史/地理/政经）即使有 B站 AI 字幕也应带上——AI 字幕经中英回译，专名不可信')
+                         '专名密集内容（历史/地理/政经）即使有 B站 AI 字幕也应带上——它是原声中文 ASR 轨，专名同样不可信')
     ap.add_argument('--finish', help='收尾模式：指定 BV号，回填纪要、状态置已完成、归档素材包到 bili_subs')
     ap.add_argument('--summary', help='纪要路径或链接，配合 --finish 使用')
     ap.add_argument('--ima', help='IMA转存状态：已转存 / 失败 / 不适用，配合 --finish 使用')

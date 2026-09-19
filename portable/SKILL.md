@@ -1,7 +1,7 @@
 ---
 name: bilibili-video-summary
 description: 用户发送 B站（bilibili）视频链接、BV号、av号或 b23.tv 短链，要求总结视频观点/要点/内容，或要求把视频内容整理成知识库条目时使用。三条路由自动选择：优先字幕直取（秒级，需登录态），无字幕或字幕不可信时走本地 ASR（whisper / Fun-ASR-Nano 双引擎，GPU 加速），再基于全文生成 14 节知识库条目（含 YAML 元数据、检索入口表、实体表、时间线、待验证清单、术语表）。本版本为「便携版」——不依赖 WorkBuddy 与 IMA，纯标准 Python/Node 脚本 + Markdown 指令，可直接装到 Claude / Cursor / ChatGPT 自定义 GPT 等任意支持自定义指令的 AI 平台。触发词：B站、bilibili、BV号、b23.tv、这个视频讲了什么、总结视频、视频要点、存知识库、知识库条目、B站归档。
-version: 2.6.7-portable
+version: 2.6.8-portable
 agent_created: true
 ---
 
@@ -141,7 +141,7 @@ python scripts/bili_asr.py "<链接>" --engine funasr-nano --hotwords <热词文
 
 判定优先级：① `references/engine_up_whitelist.txt` 白名单 → ② **视频 tag**（官方公开接口，实测比分区准）→ ③ 分区（可选，需自备映射表）→ ④ 标题/简介关键词打分 → ⑤ 默认 whisper。
 
-> ⚠️ **多语种混合长音频**（中文旁白 + 外语受访段交替，如全球采访类 UP主）：whisper 侧 `--lang` **不做 auto 映射**（默认 `zh` 会把外语段音译成汉字串），且 faster-whisper 只在首窗（约 30s）检测一次语种。这类内容单跑一遍拿不到正确结果，需按段落切分处理；详版说明见 `../workbuddy/SKILL.md` 的「语言参数」节。
+> ⚠️ **多语种混合长音频**（中文旁白 + 外语受访段交替，如全球采访类 UP主）：whisper 侧 `--lang` **不做 auto 映射**（默认 `zh` 会把外语段音译成汉字串），且 faster-whisper 只在首窗（约 30s）检测一次语种。这类内容单跑一遍拿不到正确结果，需按段落切分处理；详版说明见仓库 `workbuddy/SKILL.md` 的「语言参数」节 <https://github.com/Willson-Huang/bilibili-video-summary/blob/main/workbuddy/SKILL.md>（便携包内不含该文件，故给链接）。
 
 **代价不对称**：漏切（仍用 whisper）= 维持现状；误切 = 慢 3-10 倍且英文质量下降。**灰区一律判 whisper。**
 
@@ -153,6 +153,26 @@ python -m venv "$HOME/.cache/bilibili-video-summary/venvs/asr_eval"
 # Windows 路径为 ...\venvs\asr_eval\Scripts\pip
 # 或用 BILI_PYTHON_NANO 指向你已有的 funasr 环境
 ```
+
+**长片先按「无字幕」预估（2026-09-19 实测）**
+
+字幕轨有无**跟「充电专属」无关，跟时长强相关**：
+
+| 观测 | 数据 |
+|---|---|
+| 短片（≤20min） | 普遍带 **6 条 AI 字幕轨**：`ai-zh` / `ai-en` / `ai-ja` / `ai-es` / `ai-ar` / `ai-pt` —— B站 AI 字幕**早已不止 `ai-zh` 一种** |
+| 长片（≥50min） | **一律 `[]`**。实测 50 / 97 / 128 / 172 / 197 min 五例全空，**免费与充电专属皆然** |
+| 反例排除 | 同一季里 20min 的**充电专属**特辑照样有 6 轨 ⇒ 既排除付费墙，也说明「充电专属 ⇒ 无字幕」不成立 |
+
+⇒ 遇到长片默认按「无字幕、必走 ASR」排期，别因为同季短片有字幕就指望正片也有。核查时**必须做同 UP主 / 同季对照**：别的集返回 `ai-zh` 而它返回 `[]`，才能确认是「真无字幕」而不是接口或登录态问题。
+
+**内嵌硬字幕要单独查**（分P 名出现「双语版」时优先怀疑）：画面里烧了字幕 ≠ B站有字幕轨。取 `x/player/videoshot`（精灵图，`img_x_len`×`img_y_len` 格、每格 480×270、`image` 是多张拼图），用 PyAV 解出 ndarray 后 numpy 裁切放大即可肉眼确认（**无 ffmpeg / PIL 时 numpy + PyAV 够用**）。
+
+⚠️ **三个实测坑（2026-09-19）**：
+
+1. **`videoshot` 的 `index` 时间戳与字幕时间轴有约 +5s 偏移**。拿快照当基准跟 `ai-zh` 比对时**必须先校正**，否则会把 8/8 的吻合误判成错位。`index` 还可能**间歇返回空数组**——重试 2–3 次即得，或按 `视频时长 ÷ (图张数×100)` 线性推算。
+2. **默认 `--prompt` 会被 whisper 吐成正文**（**已在脚本层修掉，2026-09-19**）：实测素材包首段出现 `[00:00:00] 请使用正确的中文标点符号。`——提示词被当成音频内容输出。现由 `scripts/bili_asr.py` 的 `strip_prompt_leak()` 在转写后自动剥离，结果 JSON 的 `asr.prompt_leak` 记录本片剥离了几段。**不必再手动 `--prompt ""` 防这个**；但跑非中文 / 中外交错音频仍要显式 `--lang auto --prompt ""`——那是为了关掉中文先验，与泄漏无关。
+3. **画面内嵌字幕只能作语义级基准**：UP主 会精简改写（实测「中国人拍我们拍不好之类」对应语音「中国人拍我们食堂不好之类的」、「8点进图书馆」对应「八点进图书馆」）。**不能当逐字 CER 基准**，判定标准应写成「关键串是否出现」而非「逐字相等」。
 
 ### 3c. 专名纠错表与术语校验（生成纪要前必查）
 

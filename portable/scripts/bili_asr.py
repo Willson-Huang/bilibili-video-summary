@@ -291,7 +291,7 @@ def dedup_lines(lines):
 
 def fetch_subtitle_text(subs):
     """选最优中文字幕并返回 (文本, 标签)；无中文字幕返回 (None, None) 走 ASR。
-    不兜底取非中文字幕：中文视频拿英文 AI 字幕是回译，术语全部失真，宁可用本地 ASR。"""
+    不兜底取非中文字幕：中文视频拿英文 AI 字幕（`ai-en`）还得再翻一道，术语全部失真，宁可用本地 ASR。"""
     pick = (next((s for s in subs if re.match(r'^zh[-_]?CN$', s.get('lan', ''), re.I)), None)
             or next((s for s in subs if re.match(r'^ai[-_]?zh$', s.get('lan', ''), re.I)), None)
             or next((s for s in subs if re.search(r'zh|cn', s.get('lan', ''), re.I)), None))
