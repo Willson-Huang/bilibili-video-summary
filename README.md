@@ -49,14 +49,30 @@
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
-| **[v2.6.6](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.6)** | 2026-09-16 | 素材包校验与自描述 · 不可信输入防御 · 查重语义收敛（含 v2.6.1–v2.6.5 的迭代） |
+| **[v2.6.7](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.7)** | 2026-09-19 | 进度看板上报默认开启 · AI 字幕定性订正 · 多语种与批量排期实测回流 |
+| [v2.6.6](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.6) | 2026-09-16 | 素材包校验与自描述 · 不可信输入防御 · 查重语义收敛（含 v2.6.1–v2.6.5 的迭代） |
 | [v2.6.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.0) | 2026-09-16 | 进度看板子系统（零依赖独立窗口）· 引擎速度基准 · 队列 `--force-asr` 透传 |
 | [v2.5.2](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.5.2) | 2026-09-10 | 文档修正：AI 字幕经回译、专名不可信（含路由与验证基准的使用边界） |
 | [v2.5.1](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.5.1) | 2026-09-10 | 双引擎路由（whisper ↔ Fun-ASR-Nano）· 专名纠错表 · 白名单自学习 |
 | [v2.2.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.2.0) | 2026-09-05 | 结构校验 · Cookie 自动导出 · 队列按 UP主 过滤 · 合规加固 |
 | [v2.1.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.1.0) | 2026-08-30 | 首次发布：WorkBuddy 原版 + 跨平台便携版 |
 
-### v2.6.6 — 2026-09-16　[Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.6)
+### v2.6.7 — 2026-09-19　[Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.7)
+
+- **进度看板上报默认开启**（修一处「文档与实现相反」）：看板此前只在环境变量已设时才上报，未设置时上报链路在第一步就静默返回，而文档写的是「默认开启」——两者相反，且全程吞异常，**不报错、不留日志**，从外部完全看不出被跳过
+  - `bili_asr.py` 新增运行目录推导：未配置时从当前项目向上找含 `.workbuddy` 的目录，取其下的 `cache/progress/current`；只做默认值填充，不覆盖显式配置
+  - `BILI_PROGRESS=off` 仍是彻底的关闭开关（零开销语义不变）
+  - `bili_dashboard.bat` 的缺省运行目录改为显式解析，解析不出就报错退出，不再静默落到旧默认路径、开出一个空看板
+  - 一处环境限制：看板**服务**进程活不过客户端的那条命令（宿主会回收整棵进程树），所以服务需手动启动一次；之后各任务只写事件，服务在跑时会自动聚合
+- **AI 字幕定性订正**：`ai-zh` 是原声中文 ASR 轨，**不是「中→英→中」回译**（v2.5.2 的说法作废）。判据是它会出现中文同音误识（英译中不可能产生这类错误），且六条语言轨共用同一套语段边界。专名依然不可信，但错因不同、对策也不同
+- **多语种混合长音频的处理路径**：`--lang` 不做 auto 映射，模型也只在首窗检测一次语种——中外交错的长音频单跑一遍拿不到正确结果
+- **批量排期要留余量**：实测 5 条批量跑出 2.1x，明显低于单条基线，不要用单条倍率直接外推长批次
+- **有 AI 字幕时的双源做法**：需要可追溯的内容，把字幕包另存为旁证、再用本地转写覆写主包
+- **`[广告?]` 标记的真实形态**：它在行内、不在行首；按行首检索会得到 0 命中并误判「正文没有标记」
+- 硬件型号按约定写明（`NVIDIA RTX 4060 Ti 8GB`）——复现速度数据需要它
+
+<details>
+<summary><b>v2.6.6 — 2026-09-16</b>　素材包校验与自描述 · 不可信输入防御 · 查重语义收敛（点击展开）</summary>
 
 > 本版是 v2.6.1 → v2.6.6 的连续迭代，已合并为一个版本；下面只留有实际影响的部分。
 
@@ -69,6 +85,8 @@
 - **两个可选资产**：`references/专名误识速查-主题组.txt`（人工校对提示，只适合同主题视频；跨主题实测精度 0/3，正确用法是「按类型核查 + 常识」）；`scripts/baseline_errors.py`（只读体检，观察人工漏改率漂移，当前基线 20.8%）
 - 修复 `check_glossary.py` 的扫描假阴性：显式指定扫描根时曾被静默跳过、报「未发现命中」，实测漏掉 29 处命中
 - 其他：数据流向表（素材包不出本机 / 纪要→云端知识库出本机 / 队列元信息→在线表）、凭证安全提示、热词临时文件改放 `%TEMP%`、Git Bash 下 `bili.bat` 的等价调用方式
+
+</details>
 
 <details>
 <summary><b>v2.6.0 — 2026-09-16</b>　进度看板子系统（零依赖独立窗口）· 引擎速度基准 · 队列 `--force-asr` 透传（点击展开）</summary>
