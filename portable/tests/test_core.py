@@ -71,6 +71,56 @@ def test_merge_segments():
     check('长间隔不合并', len(blocks) == 2 and blocks[1]['start'] == 30.0)
 
 
+def test_strip_prompt_leak():
+    # 实测形态：whisper 把 initial_prompt 续写成第一段伪正文
+    P = '以下是普通话的中文内容，包含专业术语。请使用正确的中文标点符号。'
+
+    segs = [{'start': 0.0, 'end': 2.0, 'text': '请使用正确的中文标点符号。'},
+            {'start': 2.1, 'end': 5.0, 'text': '大家好，今天我们来聊食堂。'}]
+    out, hits = bili_asr.strip_prompt_leak(segs, P)
+    check('泄漏: 首段假正文被剔除', len(out) == 1 and hits == 1, f'{len(out)} 段 / hits={hits}')
+    check('泄漏: 真实内容与时间戳保留',
+          bool(out) and out[0]['text'].startswith('大家好') and out[0]['start'] == 2.1)
+
+    # 整段 prompt（多句叠在一段里）应被完整剥掉
+    segs = [{'start': 0.0, 'end': 3.0, 'text': P},
+            {'start': 3.1, 'end': 4.0, 'text': '正片开始。'}]
+    out, hits = bili_asr.strip_prompt_leak(segs, P)
+    check('泄漏: 整段 prompt 被剥离', len(out) == 1 and out[0]['text'] == '正片开始。',
+          f'{len(out)} 段 / -> {out[0]["text"] if out else None}')
+
+    # 假正文与真实内容同段 → 只剥前缀
+    segs = [{'start': 0.0, 'end': 3.0, 'text': '请使用正确的中文标点符号。大家好。'}]
+    out, hits = bili_asr.strip_prompt_leak(segs, P)
+    check('泄漏: 同段只剥前缀', len(out) == 1 and out[0]['text'] == '大家好。',
+          f'-> {out[0]["text"] if out else None}')
+
+    # 截断续写：整段是 prompt 的连续子串
+    segs = [{'start': 0.0, 'end': 1.0, 'text': '包含专业术语'},
+            {'start': 1.1, 'end': 2.0, 'text': '正片'}]
+    out, hits = bili_asr.strip_prompt_leak(segs, P)
+    check('泄漏: 截断续写被剔除', len(out) == 1 and hits == 1, f'{len(out)} 段 / hits={hits}')
+
+    # 正常正文不能被误伤；prompt 字样出现在后续段时也不动
+    segs = [{'start': 0.0, 'end': 1.0, 'text': '大家好'},
+            {'start': 1.1, 'end': 2.0, 'text': '以下是普通话的中文内容'}]
+    out, hits = bili_asr.strip_prompt_leak(segs, P)
+    check('泄漏: 正常正文不动', len(out) == 2 and hits == 0, f'{len(out)} 段 / hits={hits}')
+
+    # 边界：空 prompt / 空 segs / prompt 无实质分句
+    out, hits = bili_asr.strip_prompt_leak(segs, '')
+    check('泄漏: 空 prompt 原样返回', len(out) == 2 and hits == 0)
+    out, hits = bili_asr.strip_prompt_leak([], P)
+    check('泄漏: 空 segs 不崩', out == [] and hits == 0)
+    out, hits = bili_asr.strip_prompt_leak(segs, '　。 ')
+    check('泄漏: prompt 无实质分句不崩', len(out) == 2 and hits == 0)
+
+    # 不修改入参
+    src = [{'start': 0.0, 'end': 1.0, 'text': '请使用正确的中文标点符号。'}]
+    bili_asr.strip_prompt_leak(src, P)
+    check('泄漏: 不修改入参', len(src) == 1 and src[0]['text'] == '请使用正确的中文标点符号。')
+
+
 def test_mark_ads():
     kws = ['夸克App', '拼多多']
     blocks = [
@@ -593,9 +643,10 @@ def test_dedup_skip():
 
 def main():
     print('=== bilibili-video-summary 自测 ===')
-    for fn in (test_resolve_input, test_merge_segments, test_mark_ads,
-               test_pack_sections, test_pack_pipeline, test_index_heal, test_verify_pack,
-               test_finish_guards, test_dedup_skip, test_progress_hub, test_parse_duration):
+    for fn in (test_resolve_input, test_merge_segments, test_strip_prompt_leak,
+               test_mark_ads, test_pack_sections, test_pack_pipeline, test_index_heal,
+               test_verify_pack, test_finish_guards, test_dedup_skip, test_progress_hub,
+               test_parse_duration):
         if lq is None and fn.__name__ in NEED_LQ:
             print(f'-- {fn.__name__}  [跳过：本副本无 library_queue.py（便携版）]')
             continue

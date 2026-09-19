@@ -625,6 +625,58 @@ def run_nano_batch(batch_json, lang='zh', hotwords_file=None, timeout=21600):
     return j
 
 
+def _prompt_head(text, sents, prompt):
+    """text 的开头是否落在 prompt 上；是则返回命中的片段，否则返回 None。
+
+    两条判据：① 以 prompt 的某个分句开头；② 整段是 prompt 的连续子串（模型截断续写）。
+    """
+    if not text:
+        return None
+    for s in sents:
+        if text.startswith(s):
+            return s
+    if len(text) >= 6 and text in prompt:
+        return text
+    return None
+
+
+def strip_prompt_leak(segs, prompt, max_check=3):
+    """剔除 whisper 把 initial_prompt 续写出来的伪正文。
+
+    现象：`initial_prompt` 在部分音频上会被模型当成前文上下文而「续写」出来，成为转写
+    第一段假正文（实测 `[00:00:00] 请使用正确的中文标点符号。`），随后被下游当成真实
+    内容写进纪要。
+
+    做法：把 prompt 按句切分，开头段落只要以 prompt 的片段开头就反复剥离（一段里可能
+    叠了 prompt 的多句），剥空了则整段丢弃。一旦某段不命中立即停止 —— 只清开头，避免
+    误伤正文里恰好出现的同名字符串。
+
+    返回 (清洗后的 segs, 被处理的段数)，不修改入参。
+    """
+    if not prompt or not segs:
+        return list(segs), 0
+    sents = [s.strip() for s in re.split(r'[。！？；;!?\n]+', prompt) if s.strip()]
+    if not sents:
+        return list(segs), 0
+    out = list(segs)
+    hits = 0
+    for _ in range(min(max_check, len(out))):
+        text = (out[0].get('text') or '').strip()
+        if _prompt_head(text, sents, prompt) is None:
+            break
+        hits += 1
+        while True:
+            head = _prompt_head(text, sents, prompt)
+            if head is None:
+                break
+            text = text[len(head):].lstrip('，,。.、；;：: 　')
+        if text:
+            out[0] = dict(out[0], text=text)
+            break
+        out.pop(0)
+    return out, hits
+
+
 def merge_segments(segs, max_chars=90, max_gap=1.2, max_len=25.0):
     """合并短句为可读段落，保留时间戳"""
     blocks = []
@@ -882,6 +934,7 @@ def process_video(a, url_arg, out_path, holder=None, preset=None):
         # 路由 2：本地 ASR 转写
         if route is None:
             L += pack_asr_note(logged_in, a.force_asr)
+            prompt_leak = 0    # initial_prompt 泄漏段数（仅 whisper 分支可能 >0）
             if preset and preset.get('segments') is not None:
                 # 批量预转写：已下载并转写好的结果直接组装，不再下载/转写
                 segs = preset['segments']
@@ -906,6 +959,7 @@ def process_video(a, url_arg, out_path, holder=None, preset=None):
                     model, dev = holder.get()
                     load_sec = round(time.time() - t_load, 2)
                     segs, meta = transcribe_with(model, dev, fp, a.lang, a.prompt)
+                    segs, prompt_leak = strip_prompt_leak(segs, a.prompt)
                     engine_label = f'本地 Whisper {a.model}'
                 asr_sec = round(time.time() - t_asr, 2)
             asr_sec = round(asr_sec, 2)
@@ -914,7 +968,8 @@ def process_video(a, url_arg, out_path, holder=None, preset=None):
                         'model': meta.get('model') or a.model, 'segments': len(segs),
                         'lang': meta['language'],
                         'engine': meta.get('engine', 'whisper'),
-                        'engine_model': meta.get('model')}
+                        'engine_model': meta.get('model'),
+                        'prompt_leak': prompt_leak}
             if a.engine == 'funasr-nano':
                 asr_info['hotwords_count'] = meta.get('hotwords_count')
                 asr_info['hotwords_sha256'] = meta.get('hotwords_sha256')
