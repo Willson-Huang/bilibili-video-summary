@@ -394,11 +394,39 @@ def _setup_cuda_dlls():
                 os.environ['PATH'] = d + os.pathsep + os.environ.get('PATH', '')
 
 
+def _ensure_progress_dir():
+    """未显式配置时，把看板运行目录落回当前项目（2026-09-19 起「默认自动」才名副其实）。
+
+    规则（与 obsidian-wiki-compiler 的 wiki_state.py 保持一致，两处不可各改一套）：
+      1. `BILI_PROGRESS_DIR` 已设 → 尊重，不动
+      2. `BILI_PROGRESS=off` → 不启用（保住「不设即零开销」的关闭途径）
+      3. 从 cwd 向上找含 `.workbuddy` 的目录 → `<该目录>/.workbuddy/cache/progress/current`
+      4. 找不到 → 不启用（绝不在任意 cwd 下创建目录）
+
+    只做 setdefault，绝不覆盖显式配置；全程 try/except，失败即静默跳过。
+    """
+    try:
+        if os.environ.get('BILI_PROGRESS_DIR'):
+            return None
+        if (os.environ.get('BILI_PROGRESS') or '').strip().lower() == 'off':
+            return None
+        start = Path.cwd().resolve()
+        for base in [start] + list(start.parents):
+            if (base / '.workbuddy').is_dir():
+                d = base / '.workbuddy' / 'cache' / 'progress' / 'current'
+                os.environ['BILI_PROGRESS_DIR'] = str(d)
+                return d
+        return None
+    except Exception:
+        return None
+
+
 def _prog():
-    """可选进度上报（由 BILI_PROGRESS_DIR 启用）。未启用或导入失败时返回 None。
+    """可选进度上报（由 BILI_PROGRESS_DIR 启用；未设时按项目自动推导）。未启用或导入失败时返回 None。
 
     进度是旁路：这里的任何问题都不允许影响转写主流程。
     """
+    _ensure_progress_dir()
     if not os.environ.get('BILI_PROGRESS_DIR'):
         return None
     try:

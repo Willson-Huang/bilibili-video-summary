@@ -1,7 +1,7 @@
 ---
 name: bilibili-video-summary
 description: 用户发送 B站（bilibili）视频链接、BV号、av号或 b23.tv 短链，要求总结视频观点/要点/内容，或要求把视频内容整理成知识库条目时使用。三条路由自动选择：优先字幕直取（秒级，需登录态），无字幕或字幕不可信时走本地 ASR（whisper / Fun-ASR-Nano 双引擎，GPU 加速），再基于全文生成 14 节知识库条目（含 YAML 元数据、检索入口表、实体表、时间线、待验证清单、术语表）。本版本为「便携版」——不依赖 WorkBuddy 与 IMA，纯标准 Python/Node 脚本 + Markdown 指令，可直接装到 Claude / Cursor / ChatGPT 自定义 GPT 等任意支持自定义指令的 AI 平台。触发词：B站、bilibili、BV号、b23.tv、这个视频讲了什么、总结视频、视频要点、存知识库、知识库条目、B站归档。
-version: 2.6.6-portable
+version: 2.6.7-portable
 agent_created: true
 ---
 
@@ -99,10 +99,27 @@ python scripts/bili_asr.py "<链接>" --model large-v3-turbo --out "素材包/bi
 > | 字幕来源 | 判定 | 用法 |
 > |---|---|---|
 > | `zh-CN`（**人工 CC**，UP主 / 字幕组上传） | 人工产出 | 可信，直接用；**可作为本地转写的核对基准** |
-> | `ai-zh`（**B站 AI 生成**） | 机器生成，**经中文 → 英文 → 中文回译** | 地名、人名、机构名偏差可能很大（同音替代 + 回译错译）。**不可作为验证基准**；专名密集内容（历史/地理/政经）即使有 AI 字幕，也建议 `--force-asr --engine funasr-nano` 走本地转写，或至少与本地转写对照后再落纪要 |
+> | `ai-zh`（**B站 AI 生成**） | 机器生成。**⚠️ 2026-09-19 实测订正：它是原声中文 ASR 轨，不是「中→英→中」回译**（旧说法作废） | 错误类型是**中文同音误识**（与本地 whisper 同源），不是回译错译；专名仍不稳定（实测同一专名片内 2 次写错）。**不可作人工 CC 级基准**；专名密集内容建议 `--force-asr --engine funasr-nano`，或至少与本地转写对照后再落纪要 |
 >
 > 脚本会自动给 AI 字幕加「（AI 生成，可能有错字）」标记——**看到这行就别把它当标准答案**。
 > 用"字幕对照"验证引擎时，基准必须用**人工 CC 字幕**；只有 AI 字幕时结论需再用常识复核（AI 字幕本身可能已错）。
+
+**有 AI 字幕、但内容需可追溯时走双源（2026-09-18 定）**
+
+评测 / 发布会解读 / 企业史这类**产品名、型号、人名需要可追溯**的内容，不要只字幕直取：
+
+```bash
+# 1) 字幕直取跑一遍 → 主包是字幕版
+python scripts/bili_asr.py "<链接>" --out <bili_<BV>.md>
+# 2) 手工把字幕版另存为旁证（脚本不会自动留）
+#    复制 bili_<BV>.md → bili_<BV>.subtitle-ai.md
+# 3) 用本地 ASR 覆写主包，作为正文基准
+python scripts/bili_asr.py "<链接>" --force-asr --engine whisper --out <bili_<BV>.md>
+```
+
+- **主包 = 本地转写**（正文基准），**`*.subtitle-ai.md` = AI 字幕**（只作对照，**不可作基准**——它是另一路中文识别，专名同样会错，且与本地转写错点不同）。
+- 归档时**两份一起挪进 `bili_subs/`**，后续专名回查才有第二个来源。
+- 两源一致 → 直接采信；不一致且常识判不了 → 正文用主源写法，同时进「ASR 误识对照表」＋「待验证清单」，**不猜、不做含糊化改写**。
 
 ### 3b. 双引擎：whisper 与 Fun-ASR-Nano（v2.5.0 起）
 
@@ -123,6 +140,8 @@ python scripts/bili_asr.py "<链接>" --engine funasr-nano --hotwords <热词文
 ```
 
 判定优先级：① `references/engine_up_whitelist.txt` 白名单 → ② **视频 tag**（官方公开接口，实测比分区准）→ ③ 分区（可选，需自备映射表）→ ④ 标题/简介关键词打分 → ⑤ 默认 whisper。
+
+> ⚠️ **多语种混合长音频**（中文旁白 + 外语受访段交替，如全球采访类 UP主）：whisper 侧 `--lang` **不做 auto 映射**（默认 `zh` 会把外语段音译成汉字串），且 faster-whisper 只在首窗（约 30s）检测一次语种。这类内容单跑一遍拿不到正确结果，需按段落切分处理；详版说明见 `../workbuddy/SKILL.md` 的「语言参数」节。
 
 **代价不对称**：漏切（仍用 whisper）= 维持现状；误切 = 慢 3-10 倍且英文质量下降。**灰区一律判 whisper。**
 
@@ -176,7 +195,7 @@ ASR 听错的专名往往仍是「合法中文词」，快速通读不会起疑�
 | 字段 | 取值 | 用途 |
 |---|---|---|
 | `route` | `subtitle:<来源>` / `asr:<引擎>:<模型>@<设备>` | 这份正文是怎么来的 |
-| `engine` | `subtitle` / `whisper` / `funasr-nano` / `meta-only` | 决定误识模式（AI 字幕错回译、whisper 错专名） |
+| `engine` | `subtitle` / `whisper` / `funasr-nano` / `meta-only` | 决定误识模式（AI 字幕错在中文同音、whisper 错在专名） |
 | `model` / `device` | 引擎型号 / `cuda` / `cpu` | 复现与排障 |
 | `source` | 来源标签原文 | 与「字幕」说明行、转写全文标题行一致 |
 | `ts_granularity` | `cue` / `segment` / `segment(token)` | 时间戳粒度，决定引用精度 |
@@ -288,20 +307,37 @@ python scripts/process_queue.py --model large-v3
 python scripts/progress_hub.py --serve --port 8765 --dir <运行目录> --open
 
 # 或双击脚本（自动探 Python 与浏览器路径）
-scripts/bili_dashboard.bat [运行目录] [端口]
+#   不传参时须在项目根运行；也可直接传项目根，脚本会自动补成标准运行目录
+scripts/bili_dashboard.bat [运行目录或项目根] [端口]
 ```
 
 Windows 上 `msedge.exe` / `chrome.exe` 通常**不在 PATH**，脚本内置常见安装路径探测；找不到则退化为默认浏览器标签页。
 
-### 自动启动与单实例（2026-09-14 起默认开启）
+### 上报默认开启与单实例
 
-**不用手动开看板**：转写或编 wiki 时它是自动起来的。
+**上报默认开启**：转写时会自动登记任务。运行目录未设时按项目自动推导（见下）。
 
 | 开关 | 行为 |
 |---|---|
 | `auto`（**默认**） | 没有在跑就后台拉起看板并开窗；已在跑就**只复用** |
 | `manual` | 不自动拉起，只在已经开着时上报 |
 | `off` | 完全关闭（连模块都不加载） |
+
+**运行目录解析顺序**（`bili_asr.py` 的 `_ensure_progress_dir()`，只做 `setdefault`、不覆盖显式配置）：
+
+1. `BILI_PROGRESS_DIR` 已设 → 用它，不再推导
+2. `BILI_PROGRESS=off` → 不启用
+3. 否则从**当前目录**向上找含 `.workbuddy` 的目录 → `<该目录>/.workbuddy/cache/progress/current`
+4. 都找不到 → 不启用（**绝不在任意 cwd 下创建**）
+
+> ⚠️ **2026-09-19 修**：此前 `progress_dir()` 只认环境变量、未设即返回 `None`，而本节旧版
+> 写的是「默认开启」「不用手动开看板」——**文档与实现相反**。agent 按文档行事（不设变量）
+> 就什么都不会发生，且上报链路 `try/except` 全吞：**退出码 0、零日志**，外部完全看不出被跳过。
+
+⚠️ **看板服务必须由用户手动常驻一次**：`ensure_serving()` 能在同一条命令内拉起服务
+（实测 `/api/health` 返 200），但**服务活不过该条 agent 命令**——宿主 Job Object 会在命令
+结束时回收整棵进程树（`DETACHED | BREAKAWAY` 也逃不出）。分工：**服务由用户启动一次**
+（`bili_dashboard.bat [项目根]`），转写侧只负责**写 events**；服务在跑时会自动聚合。
 
 ```bash
 BILI_PROGRESS=off python bili_asr.py ...        # 单次关闭
@@ -319,7 +355,7 @@ BILI_PROGRESS=off python bili_asr.py ...        # 单次关闭
 | 生成纪要 | 我（主 agent） | 命令行 `--emit` |
 | 其它脚本 | 任意进程 | `import progress_hub; progress_hub.auto(task=..., stage=..., pct=...)` |
 
-**全部由环境变量 `BILI_PROGRESS_DIR` 启用**——不设置时上报代码是空操作，零开销、零行为变化：
+**由 `BILI_PROGRESS_DIR` 指定运行目录**——未设置时按项目自动推导（见上）；`BILI_PROGRESS=off` 时上报代码是空操作，零开销、零行为变化：
 
 ```bash
 BILI_PROGRESS_DIR="<run_dir>" python scripts/bili_asr.py --batch-file ... --engine funasr-nano
@@ -341,7 +377,9 @@ BILI_PROGRESS_DIR="<run_dir>" python scripts/bili_asr.py --batch-file ... --engi
 
 两级处理：
 
-1. **脚本预标记**：`bili_asr.py` 用 `references/ad_keywords.txt` 扫描转写段落，命中的段落加 `[广告?]` 前缀，并在素材包末尾生成「疑似广告段落」表格（时间戳 + 命中词 + 内容）。
+1. **脚本预标记**：`bili_asr.py` 用 `references/ad_keywords.txt` 扫描转写段落，命中的段落**在该行时间戳之后**加 `[广告?]` 标记，并在素材包末尾生成「疑似广告段落」表格（时间戳 + 命中词 + 内容）。
+   ⚠️ **标记的准确形态是 `[hh:mm:ss] [广告?] 正文…`——它在行内、不在行首**（2026-09-18 实测）。按「行首以 `[广告?]` 开头」检索会得到 0 命中，进而误判「元信息说有标记、正文却没有」。核查时**必须整行子串匹配**，不要锚定行首。
+   ⚠️ 元信息行里标注的命中数**含模板说明文字**，不等于正文标记数；以「疑似广告段落表 + 行内标记」为准。
 2. **AI 最终判断**：生成纪要时跳过所有带 `[广告?]` 的段落，不进核心结论、不进内容要点、不进金句。脚本只做提示，判断权在 AI——词表漏掉的广告口播同样要剔除。
 
 词表可增删：直接改 `references/ad_keywords.txt`，每行一个词，`#` 开头为注释，改完立即生效。当前 74 词 + 11 条排除短语，分五类：
@@ -476,6 +514,9 @@ python scripts/bili_asr.py --batch-file <items.json> --model large-v3-turbo
 ```
 
 输出 `{"ok": true, "count": N, "results": [...]}`，单条失败记在 `results[].error`，不中断整批。
+
+> ⚠️ **批量排期要留余量（2026-09-18 实测反例）**：5 条中文口播（合计 3,225.5s 音频）走 `--batch-file` 批量，**整批耗时 1,555s ≈ 2.1x**，明显低于 5.1x 基线；同批单条（502s 音频）剔除冷启动后约 4.2–4.8x，接近基线。差额归因未定位（疑与逐条下载/转码、逐段热词注入有关）。
+> **结论：单条按 5x 估、批量为 5x 估完再加 1.5–2.5 倍余量；不要用 5x 直接外推长批次的总时长。**
 
 ### 已验证不可用的提速方案
 
