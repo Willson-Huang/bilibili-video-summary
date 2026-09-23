@@ -143,4 +143,17 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    log_path = Path.cwd() / 'verify_structure_out.txt'
+    real = sys.stdout
+    with open(log_path, 'w', encoding='utf-8') as f:
+        sys.stdout = f
+        try:
+            code = main()
+        except SystemExit as e:
+            code = e.code
+        finally:
+            sys.stdout = real
+    print(f'详细结果写入 {log_path}')
+    for line in log_path.read_text(encoding='utf-8').splitlines()[-6:]:
+        print('  ' + line)
+    sys.exit(code)

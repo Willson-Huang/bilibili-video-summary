@@ -51,7 +51,8 @@
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
-| **[v2.6.8](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.8)** | 2026-09-19 | 修复 `--prompt` 泄漏成正文 · 便携版补齐实测坑 · AI 字幕口径全仓订正 |
+| **[v2.6.9](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.9)** | 2026-09-24 | 校验输出改走文件 · 子代理中间文件位置约束 · 派发后主线程不空等 · 维护与记账规则 |
+| [v2.6.8](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.8) | 2026-09-19 | 修复 `--prompt` 泄漏成正文 · 便携版补齐实测坑 · AI 字幕口径全仓订正 |
 | [v2.6.7](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.7) | 2026-09-19 | 进度看板上报默认开启 · AI 字幕定性订正 · 多语种与批量排期实测回流 |
 | [v2.6.6](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.6) | 2026-09-16 | 素材包校验与自描述 · 不可信输入防御 · 查重语义收敛（含 v2.6.1–v2.6.5 的迭代） |
 | [v2.6.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.0) | 2026-09-16 | 进度看板子系统（零依赖独立窗口）· 引擎速度基准 · 队列 `--force-asr` 透传 |
@@ -60,7 +61,16 @@
 | [v2.2.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.2.0) | 2026-09-05 | 结构校验 · Cookie 自动导出 · 队列按 UP主 过滤 · 合规加固 |
 | [v2.1.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.1.0) | 2026-08-30 | 首次发布：WorkBuddy 原版 + 跨平台便携版 |
 
-### v2.6.8 — 2026-09-19　[Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.8)
+### v2.6.9 — 2026-09-24　[Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.9)
+
+- **两个校验脚本的详细结果改走文件**：`verify_structure.py` 与 `verify_pack.py` 把逐条明细写进当前目录的 `verify_structure_out.txt` / `verify_pack_out.txt`，终端只打印末 6 行汇总，**退出码不变**，既有的 `&&` 串联不受影响。此前 `--dir` 全库体检会把几十行明细一次打到终端，占掉一整个回合
+- **子代理的中间文件位置写进 prompt（第五个硬动作）**：草稿、临时脚本与临时清单只写当批的缓存目录，不得写系统临时目录、库根目录或用户主目录。此前有一批子代理在库根与工作区根各建了一个含 30 个文件的临时目录
+- **派发之后主线程不空等**：子代理在跑时，主线程接着做不依赖它产出的工作；取消「等全部返回再统一复验」那一次同步等待，复验并进结构校验。依据是一次 37.1 分钟的双管线批次里，与子代理活动重合的等待累计 692.3 秒
+- **新增维护约定**：本文件只保留当前有效规则与一句实测依据；版本说明与历史沿革改记到工作区的 `性能记录-技能沿革.md`，并按批次记录入口文件体积
+- 三处副本（`workbuddy/`、`portable/`、已装副本）同步，`scripts/` 两个脚本改动后三副本 md5 一致；`compileall` 通过，`test_core.py` 与 `test_dashboard_times.js`（17 项）全通过
+
+<details>
+<summary><b>v2.6.8 — 2026-09-19</b>　修复 `--prompt` 泄漏成正文 · 便携版补齐实测坑 · AI 字幕口径全仓订正（点击展开）</summary>
 
 - **修掉一处会污染纪要的静默缺陷**：默认 `--prompt` 会被 whisper 当成前文上下文**续写出来**，成为素材包第一段假正文 —— `[00:00:00] 请使用正确的中文标点符号。`。它随后被当成真实内容写进纪要，而素材包外观上完全看不出来。本机 128 份历史素材包 0 份命中（低频），但已实测复现
   - 修法**不动默认值**（它承担中文先验：简体 + 标点），改在转写之后加清洗层：新增 `strip_prompt_leak()` 按 prompt 分句反复剥离开头伪正文段，剥空则整段丢弃；只清开头、不误伤正文；另覆盖「整段是 prompt 连续子串」的截断续写形态
@@ -68,6 +78,8 @@
   - 新增 10 条单测。开发中由单测抓到一个会崩的真实缺陷：初始化原在「下载音频」分支内，而**批量预转写分支跳过下载与转写直接组装素材包**，走那条路会抛 `UnboundLocalError` —— 已上提到两条路径的共同入口
 - **便携版补齐与平台无关的实测方法**（此前缺整节）：长片字幕轨规律（跟时长强相关、与充电专属无关）、内嵌硬字幕查法、三个实测坑（`videoshot` 时间戳约 +5s 偏移 / `index` 间歇返回空数组 / 画面内嵌字幕只能作语义级基准）；并修正一处**失效链接**（原指向 `../workbuddy/SKILL.md`，便携包内不含该文件）
 - **AI 字幕口径全仓订正**：`ai-zh` 是原声中文 ASR 轨、不是回译 —— 上一轮只扫了 `*.md`，本轮补扫 `.txt` / `.py`，订正 `engine_verify_log.txt`、`bili_asr.py` docstring、`library_queue.py` 三处遗留旧表述
+
+</details>
 
 <details>
 <summary><b>v2.6.7 — 2026-09-19</b>　进度看板上报默认开启 · AI 字幕定性订正 · 多语种与批量排期实测回流（点击展开）</summary>

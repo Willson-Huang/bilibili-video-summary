@@ -1,7 +1,7 @@
 ---
 name: bilibili-video-summary
 description: 用户发送 B站（bilibili）视频链接、BV号、av号或 b23.tv 短链，要求总结视频观点/要点/内容，或要求把视频内容整理成知识库条目时使用。三条路由自动选择：优先字幕直取（秒级，需登录态），无字幕或字幕不可信时走本地 ASR（whisper / Fun-ASR-Nano 双引擎，GPU 加速），再基于全文生成 14 节知识库条目（含 YAML 元数据、检索入口表、实体表、时间线、待验证清单、术语表）。本版本为「便携版」——不依赖 WorkBuddy 与 IMA，纯标准 Python/Node 脚本 + Markdown 指令，可直接装到 Claude / Cursor / ChatGPT 自定义 GPT 等任意支持自定义指令的 AI 平台。触发词：B站、bilibili、BV号、b23.tv、这个视频讲了什么、总结视频、视频要点、存知识库、知识库条目、B站归档。
-version: 2.6.8-portable
+version: 2.6.9-portable
 agent_created: true
 ---
 
@@ -465,6 +465,8 @@ python scripts/verify_structure.py raw/<新生成的文件>.md
 python scripts/verify_structure.py --dir raw     # 全库体检
 ```
 
+详细结果写进当前目录的 `verify_structure_out.txt`，终端只打印末 6 行汇总（2026-09-24 起）。**在当批的缓存目录下执行**，日志就不会落在库根；要看逐条明细去读那个文件，不要为了省事把 `--dir` 的完整输出打到终端。
+
 校验四项：frontmatter 齐全、tags 6–10 / entities 8–12、14 节齐全、内容要点已表格化。**任一项不通过就退回重写，不要带着结构缺陷交付。**
 
 与 `verify_coverage.py` 分工：本脚本查「结构对不对」，`verify_coverage.py <原> <新>` 查「增强时有没有遗失」。重写时两个都必须过。
@@ -478,6 +480,8 @@ python scripts/verify_pack.py <素材包.md>            # 单份
 python scripts/verify_pack.py --dir <素材包目录>      # 整目录体检（历史包宽容）
 python scripts/verify_pack.py --dir <素材包目录> --strict   # 新产物姿态：缺元信息块也判错
 ```
+
+详细结果写进当前目录的 `verify_pack_out.txt`，终端只打印末 6 行汇总（2026-09-24 起）。**在当批的缓存目录下执行**；`--dir` 全库体检时尤其要看那个文件里的逐条明细。
 
 查五组：基本信息齐全 / 正文形态三选一（字幕全文、转写全文、`--only-meta` 预扫描包）/ 元信息块字段与取值自洽 / 正文**每一行**都带 `[hh:mm:ss]` 前缀 / 文件名 BV 与正文 BV 一致。
 
@@ -576,3 +580,8 @@ python scripts/bili_asr.py --batch-file <items.json> --model large-v3-turbo
 - 报 `cublas64_12.dll is not found`：CUDA DLL 未注册，检查 `nvidia-*` 包是否完好。
 - 报 `No such file or directory ... .m4a`：yt-dlp 产物路径解析失败，脚本已内置 stem 兜底，仍报错则检查 `--keep-audio` 与磁盘权限。
 - pip 装包必须传 `PYTHONPATH=`（清空平台注入的 shim），用国内镜像更快：`pip install -i https://mirrors.cloud.tencent.com/pypi/simple ...`
+
+## 维护约定（2026-09-24 加）
+
+- 本文件只保留**当前有效的规则**与**一句实测依据**。新增的版本说明、历史沿革、旧参数取舍过程写进仓库的 `docs/避坑经验.md` 与 Release 说明，不要再往本文件追加章节。
+- 这一版的实测细节已经比 workbuddy 版精简，补内容时优先补规则与判据，不补单次批次的记录。
