@@ -13,6 +13,7 @@
   5. 进度看板折叠（终态冻结、阶段不回退、加权总进度）
 """
 import json
+import os
 import sys
 import tempfile
 import time
@@ -31,7 +32,7 @@ try:
 except Exception:
     lq = None
 
-NEED_LQ = ('test_index_heal', 'test_finish_guards', 'test_dedup_skip')
+NEED_LQ = ('test_index_heal', 'test_finish_guards', 'test_dedup_skip', 'test_audit_fixes')
 
 FAILS = []
 
@@ -641,12 +642,115 @@ def test_dedup_skip():
         _sh.rmtree(tmp, ignore_errors=True)
 
 
+def test_audit_fixes():
+    """B/C 类修复的回归：失败判据、临时文件唯一性、术语表替换边界、YAML 形态、常量一致。"""
+    class _P:
+        def __init__(self, out, rc):
+            self.stdout, self.stderr, self.returncode = out, '', rc
+
+    # P0-1：插件把错误 JSON 写到 stdout 且退出码是 0，只看 stdout 是否为空会把失败当成功
+    saved_run = lq.subprocess.run
+    try:
+        lq.subprocess.run = lambda *a, **k: _P('{"error": "查询记录请求失败"}', 0)
+        caught = ''
+        try:
+            lq.lib_api('t', 'query_database_record.py', [])
+        except Exception as e:
+            caught = str(e)
+        check('P0-1 错误 JSON + 退出码 0 判为失败', '调用失败' in caught, caught[:80])
+        lq.subprocess.run = lambda *a, **k: _P('{"results": [], "has_more": false}', 0)
+        check('P0-1 正常返回仍可解析',
+              lq.lib_api('t', 'x.py', []) == {'results': [], 'has_more': False})
+        lq.subprocess.run = lambda *a, **k: _P('not json', 0)
+        caught = ''
+        try:
+            lq.lib_api('t', 'x.py', [])
+        except Exception as e:
+            caught = str(e)
+        check('P0-1 非 JSON 输出判为失败', '不是 JSON' in caught, caught[:80])
+    finally:
+        lq.subprocess.run = saved_run
+
+    # P0-2：批量描述文件必须带进程号，且跑完即删
+    saved_batch = lq.run_bili
+    seen = {}
+    try:
+        def _fake(args, timeout=7200):
+            seen['path'] = Path(args[1])
+            seen['existed'] = Path(args[1]).is_file()
+            return {'results': []}
+        lq.run_bili = _fake
+        lq.run_bili_batch([{'url': 'u', 'out': 'o'}], 'large-v3-turbo')
+        check('P0-2 批量描述文件带进程号',
+              str(os.getpid()) in seen['path'].name and seen['existed'], seen['path'].name)
+        check('P0-2 批量描述文件跑完即删', not seen['path'].exists(), seen['path'])
+    finally:
+        lq.run_bili = saved_batch
+
+    # P0-3：术语表替换的三档行为 + 逐行豁免 + 备份
+    import check_glossary as cg
+    tmp = Path(tempfile.mkdtemp(prefix='cg_test_'))
+    try:
+        rows = [('耳塞', 'RSI', 'AI 语境', False), ('田园栋', '田渊栋', 'ALL', True)]
+        p = tmp / 'a.md'
+        p.write_text('今天试了三款降噪耳塞。田园栋发过论文。\n', encoding='utf-8')
+        hits, _ = cg.scan_file(p, rows, fix=True)
+        text = p.read_text(encoding='utf-8')
+        check('P0-3 --fix 只替换 ALL 条目', '耳塞' in text and '田园栋' not in text, text)
+        check('P0-3 未替换的条目仍报为待修',
+              any(h['wrong'] == '耳塞' and h['action'] == '未替换' for h in hits))
+        cg.scan_file(p, rows, fix=True, force=['耳塞'])
+        check('P0-3 点名后才替换', 'RSI' in p.read_text(encoding='utf-8'))
+        check('P0-3 改写前留了 .bak', p.with_name('a.md.bak').is_file())
+        p2 = tmp / 'b.md'
+        p2.write_text('耳塞本就该是耳塞。<!-- glossary:ignore -->\n', encoding='utf-8')
+        hits2, changed2 = cg.scan_file(p2, rows, fix=True, force_all=True)
+        check('P0-3 逐行豁免生效',
+              not hits2 and not changed2 and 'RSI' not in p2.read_text(encoding='utf-8'))
+    finally:
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+
+    # P1-6：frontmatter 的两种列表形态都要能读出来
+    import verify_structure as vs
+    inline = 'tags: [a, b, c, d, e, f]\nentities: [a, b, c, d, e, f, g, h]\n'
+    block = 'tags:\n  - a\n  - b\n  - c\nentities:\n  - x\n  - y\n'
+    check('P1-6 内联数组形态', vs._yaml_list(inline, 'tags') == (['a', 'b', 'c', 'd', 'e', 'f'], 'inline'),
+          vs._yaml_list(inline, 'tags'))
+    check('P1-6 块状列表形态', vs._yaml_list(block, 'entities') == (['x', 'y'], 'block'),
+          vs._yaml_list(block, 'entities'))
+    check('P1-6 读不出时标 missing（不再静默跳过）',
+          vs._yaml_list('tags:\n', 'tags') == ([], 'missing'))
+
+    # P2-5：WBI 混洗表在 Python 与 JS 各一份，必须逐项一致
+    import re as _re
+    sp = Path(__file__).resolve().parent.parent / 'scripts'
+    py_src = (sp / 'bili_wbi.py').read_text(encoding='utf-8')
+    js_src = (sp / 'bili_wbi.mjs').read_text(encoding='utf-8')
+    m_py = _re.search(r'MIXIN\s*=\s*\[([^\]]+)\]', py_src)
+    m_js = _re.search(r'MIXIN\s*=\s*\[([^\]]+)\]', js_src)
+    check('P2-5 两份 MIXIN 都能读到', bool(m_py and m_js))
+    if m_py and m_js:
+        py_nums = [int(x) for x in _re.findall(r'\d+', m_py.group(1))]
+        js_nums = [int(x) for x in _re.findall(r'\d+', m_js.group(1))]
+        check('P2-5 两份 MIXIN 逐项一致', py_nums == js_nums,
+              f'py={len(py_nums)} js={len(js_nums)}')
+
+    # C3：过期阈值按阶段取值
+    check('C3 转写阶段仍是 10/30', ph.stale_thresholds('asr') == (10, 30),
+          ph.stale_thresholds('asr'))
+    check('C3 生成纪要阶段放宽到 300/900', ph.stale_thresholds('notes') == (300, 900),
+          ph.stale_thresholds('notes'))
+    check('C3 未知阶段回落兜底值',
+          ph.stale_thresholds('no-such') == (ph.STALE_WARN_SEC, ph.STALE_BAD_SEC))
+
+
 def main():
     print('=== bilibili-video-summary 自测 ===')
     for fn in (test_resolve_input, test_merge_segments, test_strip_prompt_leak,
                test_mark_ads, test_pack_sections, test_pack_pipeline, test_index_heal,
                test_verify_pack, test_finish_guards, test_dedup_skip, test_progress_hub,
-               test_parse_duration):
+               test_parse_duration, test_audit_fixes):
         if lq is None and fn.__name__ in NEED_LQ:
             print(f'-- {fn.__name__}  [跳过：本副本无 library_queue.py（便携版）]')
             continue

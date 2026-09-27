@@ -21,6 +21,7 @@ import argparse
 import base64
 import ctypes
 import json
+import os
 import shutil
 import sqlite3
 import sys
@@ -34,7 +35,8 @@ except ImportError:
     sys.exit('缺少 cryptography：pip install cryptography -i https://mirrors.cloud.tencent.com/pypi/simple')
 
 CHROME_DIR = Path.home() / 'AppData' / 'Local' / 'Google' / 'Chrome' / 'User Data'
-OUT_FILE = Path.home() / '.workbuddy' / '.bilibili_cookie'
+# 必须与 bili_asr.py 的 COOKIE_FILE 指向同一个文件，否则导出与读取会各写各的
+OUT_FILE = Path(os.environ.get('BILI_COOKIE', str(Path.home() / '.workbuddy' / '.bilibili_cookie')))
 WANT = ['SESSDATA', 'bili_jct', 'DedeUserID', 'DedeUserID__ckMd5', 'buvid4']
 
 sys.stdout.reconfigure(encoding='utf-8')
@@ -93,7 +95,7 @@ def profiles(user_data: Path, only=None):
 def read_cookies(prof: Path, key: bytes):
     """Chrome 运行时 Cookies 被锁，先复制再读。"""
     src = prof / 'Network' / 'Cookies'
-    tmp = Path(tempfile.gettempdir()) / f'_chrome_ck_{prof.name}.db'
+    tmp = Path(tempfile.gettempdir()) / f'_chrome_ck_{prof.name}_{os.getpid()}.db'
     shutil.copy2(src, tmp)
     out = []
     try:
@@ -159,6 +161,12 @@ def main():
         return
     OUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     OUT_FILE.write_text(cookie, encoding='utf-8')
+    try:
+        # POSIX 下立刻收紧到仅本人可读写；Windows 只切换只读属性，
+        # 但 %USERPROFILE% 下的目录本身已只对该用户开放，实际暴露面有限。
+        os.chmod(OUT_FILE, 0o600)
+    except OSError as e:
+        print(f'[提醒] 未能收紧 cookie 文件权限: {e}')
     print(f'\n已写入: {OUT_FILE}  ({len(cookie)} 字符)')
     print('验证: 跑一个视频看 route 是否变为 subtitle:*，或素材包不再出现「未配置登录凭据」')
 

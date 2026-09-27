@@ -127,9 +127,12 @@ def load_index(cache_dir):
 
 
 def save_index(cache_dir, data):
+    """索引是素材包的唯一索引；中断留下半截文件会让下次读取拿到不完整数据，故原子替换。"""
     p = cache_index(cache_dir)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+    tmp = p.with_name(p.name + '.tmp')
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+    os.replace(tmp, p)
 
 
 def extract_pubdate(md_path):
@@ -207,7 +210,37 @@ def lib_api(token, script, args):
     out = (p.stdout or '').strip()
     if not out:
         raise RuntimeError(f'{script} 无输出: ' + (p.stderr or '')[-400:])
-    return json.loads(out)
+    try:
+        j = json.loads(out)
+    except Exception:
+        raise RuntimeError(f'{script} 输出不是 JSON: ' + out[:200])
+    # 插件统一用 error_exit 报错：把 {"error": ...} 写到 stdout，而它的退出码默认是 0。
+    # 因此只判断 stdout 是否为空会把失败当成成功——查询失败会退化成「台账为空」，
+    # 回写失败会退化成「已处理」。这里必须同时看退出码与 error 键。
+    if p.returncode != 0 or (isinstance(j, dict) and j.get('error')):
+        detail = j.get('error') if isinstance(j, dict) else out[:200]
+        raise RuntimeError(f'{script} 调用失败（退出码 {p.returncode}）: {detail}')
+    return j
+
+
+def query_all(token, database_id, page_size=200, max_pages=20):
+    """读全台账。query 接口按游标分页：只取第一页会让第 200 行之后的记录永远看不见。"""
+    out, cursor, pages = [], '', 0
+    while True:
+        args = ['--database-id', database_id, '--page-size', str(page_size)]
+        if cursor:
+            args += ['--start-cursor', cursor]
+        res = lib_api(token, 'query_database_record.py', args)
+        out.extend(res.get('results') or [])
+        pages += 1
+        cursor = str(res.get('next_cursor') or '')
+        if not res.get('has_more') or not cursor:
+            break
+        if pages >= max_pages:
+            print(f'[警告] 台账分页读到第 {pages} 页仍未结束，已停止读取，结果可能不完整',
+                  file=sys.stderr)
+            break
+    return out
 
 
 def engine_args(a):
@@ -242,10 +275,20 @@ def run_bili(args, timeout=3600):
 
 def run_bili_batch(items, model, timeout=7200, extra=None):
     """items: [{'url':..., 'out':...}]。整批只加载一次模型。extra 为透传参数（engine/hotwords）。"""
-    tmp = Path(tempfile.gettempdir()) / '_bili_batch.json'
+    # 固定名会让同机并发的两批互相覆盖：批次与产物的对应关系一旦被覆盖，
+    # 转写结果就会按错误的 out 关键字回填。文件名必须带进程号。
+    tmp = Path(tempfile.gettempdir()) / f'_bili_batch_{os.getpid()}.json'
     tmp.write_text(json.dumps(items, ensure_ascii=False), encoding='utf-8')
-    j = run_bili(['--batch-file', str(tmp), '--model', model] + (extra or []), timeout=timeout)
-    return j.get('results', [])
+    try:
+        j = run_bili(['--batch-file', str(tmp), '--model', model] + (extra or []),
+                     timeout=timeout)
+        return j.get('results', [])
+    finally:
+        # 描述文件含本机音频绝对路径，跑完即删，不在临时目录留残留
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def update(token, database_id, records):
@@ -286,6 +329,8 @@ def main():
     ap.add_argument('--cache-dir', default=str(DEFAULT_CACHE), help='素材包缓存目录')
     ap.add_argument('--meta-only', action='store_true')
     ap.add_argument('--limit', type=int, default=0)
+    ap.add_argument('--retry-failed', action='store_true',
+                    help='把状态为「失败」的行也纳入本次处理；默认跳过（失败行不会被重复处理）')
     ap.add_argument('--up', help='只处理指定 UP主（按 UP主 列精确匹配）')
     ap.add_argument('--model', default='large-v3-turbo')
     ap.add_argument('--engine', default='whisper', choices=['whisper', 'funasr-nano'],
@@ -305,10 +350,8 @@ def main():
     cache_dir = Path(a.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. 读台账
-    res = lib_api(a.token, 'query_database_record.py',
-                  ['--database-id', a.database_id, '--page-size', '200'])
-    results = res.get('results', [])
+    # 1. 读台账（按游标取全，不能只取第一页）
+    results = query_all(a.token, a.database_id)
 
     # 2. 建立已处理索引：BV号 -> record_id
     handled = {}
@@ -427,13 +470,15 @@ def main():
                           'properties': props}, ensure_ascii=False, indent=2))
         return
 
-    # 3. 挑出待处理行
+    # 3. 挑出待处理行（失败行默认跳过，--retry-failed 才纳入）
     targets = []
     for r in results:
         rid = r.get('record_id')
         st = field_text(r, '状态')
         link = field_text(r, '视频链接').strip()
-        if not link or st in ('已完成', '失败', ST_DUP):
+        if not link or st in ('已完成', ST_DUP):
+            continue
+        if st == '失败' and not a.retry_failed:
             continue
         if st == ST_TRANSCRIBED and not a.meta_only:
             continue
@@ -453,7 +498,7 @@ def main():
 
     print(f'待处理 {len(targets)} 条，转写={"关" if a.meta_only else "开"}\n', file=sys.stderr)
 
-    probe = Path(tempfile.gettempdir()) / '_bili_probe.md'
+    probe = Path(tempfile.gettempdir()) / f'_bili_probe_{os.getpid()}.md'
     today = datetime.now().strftime('%Y-%m-%d')
     stage1 = []  # [(rid, link, bv, meta)] 待转写
 
@@ -531,7 +576,18 @@ def main():
                  for rid, link, bv, meta in stage1]
         print(f'\n批量转写 {len(batch)} 条（模型只加载一次，engine={a.engine}）...', file=sys.stderr)
         t0 = time.time()
-        results = run_bili_batch(batch, a.model, extra=engine_args(a))
+        try:
+            results = run_bili_batch(batch, a.model, extra=engine_args(a))
+        except Exception as e:
+            # 整批失败不能让已进队列的台账更新丢掉：逐条记为失败并让它随末尾的统一冲刷提交，
+            # 否则进程在这里终止时这批回写永远提交不出去。
+            msg = f'批量转写整批失败: {str(e)[:150]}'
+            print(f'    {msg}', file=sys.stderr)
+            for _rid, _link, _bv, _meta in stage1:
+                queue_update({'record_id': _rid, 'properties': {
+                    '状态': {'select': '失败'}, '备注': {'text': msg}}})
+                report['failed'].append({'record_id': _rid, 'link': _link, 'error': msg})
+            results = []
         print(f'批量转写完成，用时 {round(time.time() - t0)}s\n', file=sys.stderr)
 
         for (rid, link, bv, meta), r in zip(stage1, results):
@@ -567,6 +623,11 @@ def main():
                                         'up': meta.get('up'), 'note_name': nm})
             print(f"    {bv} 转写完成 -> {out_md.name}（缓存，--finish 收尾时归档）", file=sys.stderr)
 
+    try:
+        probe.unlink(missing_ok=True)      # 探针文件含标题与简介，跑完即删
+    except Exception:
+        pass
+
     write_failed_ids.update(flush_updates())
     # 回写失败的项从 processed 剔除，进 write_failed——台账没回填 ≠ 闭环成功
     if write_failed_ids:
@@ -581,4 +642,12 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        # 顶层兜底：异常也要输出约定好的 JSON，调用方才能解析；
+        # 已提交的台账回写保留，未提交的靠 --retry-failed 或重跑补上。
+        print(json.dumps({'error': f'{type(e).__name__}: {e}'}, ensure_ascii=False))
+        sys.exit(1)

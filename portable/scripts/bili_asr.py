@@ -8,7 +8,7 @@ B站视频 → 本地 Whisper 转写 → 结构化素材包
                      [--hf-mirror] [--lang zh]
 依赖: faster-whisper, yt-dlp, imageio-ffmpeg
 """
-import argparse, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time, urllib.parse, urllib.request
+import argparse, json, os, re, shutil, subprocess, sys, tempfile, time, urllib.parse, urllib.request
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding='utf-8')
@@ -30,6 +30,12 @@ UP_WHITELIST = Path(__file__).resolve().parent.parent / 'references' / 'engine_u
 # 分区映射表不随本仓库分发（上游文档因合规原因已关停）；缺失时该信号自动跳过
 TID_V2_MAP = Path(os.environ.get('BILI_TID_MAP', str(
     Path(__file__).resolve().parent.parent / 'references' / 'bilibili_tid_v2_map.txt')))
+
+# 下载的重试与超时。yt-dlp 的默认值不透明，出问题时看不出重试了几次、隔了多久，
+# 所以显式给出，并允许用环境变量覆盖。
+DL_TIMEOUT = int(os.environ.get('BILI_DOWNLOAD_TIMEOUT', '1800'))
+DL_RETRIES = int(os.environ.get('BILI_DOWNLOAD_RETRIES', '10'))
+DL_RETRY_SLEEP_MAX = int(os.environ.get('BILI_DOWNLOAD_SLEEP_MAX', '20'))
 
 # 关键词打分表：命中 NANO_HINTS +1，命中 WHISPER_HINTS -1，净分 >=1 建议 nano
 NANO_HINTS = (
@@ -197,6 +203,14 @@ def fmt_date(u):
     return time.strftime('%Y-%m-%d %H:%M', time.localtime(u))
 
 
+def _atomic_write(path, text):
+    """原子写入：先写同目录临时文件再替换，避免中断时留下半截素材包被下游当成完整的读。"""
+    p = Path(path)
+    tmp = p.with_name(p.name + '.tmp')
+    tmp.write_text(text, encoding='utf-8')
+    os.replace(tmp, p)
+
+
 def resolve_input(raw):
     """解析链接/BV/av，返回 (canonical_url, page)"""
     s = raw.strip()
@@ -334,7 +348,9 @@ def download_audio(url, out_dir, cookie=None, page=1, stem='audio'):
     # 不转码：B站音轨本身就是 m4a(AAC)，PyAV 可直接解码，省掉 ffmpeg 转码开销
     cmd = [sys.executable, '-m', 'yt_dlp', '-f', 'bestaudio/best',
            '--ffmpeg-location', ffmpeg_path(),
-           '--no-playlist', '-o', tpl, '--no-warnings', '--print-json']
+           '--no-playlist', '-o', tpl, '--no-warnings', '--print-json',
+           '--retries', str(DL_RETRIES), '--fragment-retries', str(DL_RETRIES),
+           '--retry-sleep', f'exp=1:{DL_RETRY_SLEEP_MAX}']
     cu = url if 'p=' in url else f"{url}?p={page}"
     cf = None
     if cookie:
@@ -346,7 +362,12 @@ def download_audio(url, out_dir, cookie=None, page=1, stem='audio'):
         cmd += ['--cookies', str(cf)]
     cmd.append(cu)
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
+        # 这是全脚本唯一需要给超时的地方：下载卡住时没有超时会挂起整个批次，
+        # 而看板只能显示「下载音频…」，看不出是卡住还是在跑。
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
+                           errors='replace', timeout=DL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f'音频下载超时（{DL_TIMEOUT} 秒）：{cu}')
     finally:
         if cf:
             try:
@@ -512,10 +533,15 @@ class ModelHolder:
 
 
 def transcribe_with(model, device, audio, lang, prompt):
+    # 温度回退阶梯：传单个浮点值等于关掉整条阶梯（faster-whisper 会把它转成单元素列表），
+    # 重复念、低置信的段落就没有任何补救手段。0.0 仍是首选温度，只有压缩比超过 2.4
+    # 或平均对数概率低于 -1.0 时才升到更高温度，正常素材的首选结果不变。
     segs, info = model.transcribe(
         audio, language=lang, beam_size=5, vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=500),
-        initial_prompt=prompt, condition_on_previous_text=False, temperature=0)
+        initial_prompt=prompt, condition_on_previous_text=False,
+        temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        compression_ratio_threshold=2.4, log_prob_threshold=-1.0)
     out = []
     for s in segs:
         out.append({'start': s.start, 'end': s.end, 'text': s.text.strip()})
@@ -877,8 +903,11 @@ def build_parser():
     return ap
 
 
-def process_video(a, url_arg, out_path, holder=None, preset=None):
+def process_video(a, url_arg, out_path=None, holder=None, preset=None):
     """处理单个视频，返回结构化结果（不打印）。holder 非空时复用其模型实例。
+
+    out_path 留空时按解析出的 BV 与分P 自动命名（av 号链接在 resolve_input 阶段
+    还拿不到 BV，在调用处拼名字会得到 bili_None.md）。
 
     preset: dict，批量预转写模式下传入 {'audio': 已下载音频路径, 'segments': 已转写段落,
                                         'engine_meta': {...}}
@@ -935,6 +964,7 @@ def process_video(a, url_arg, out_path, holder=None, preset=None):
         if route is None:
             L += pack_asr_note(logged_in, a.force_asr)
             prompt_leak = 0    # initial_prompt 泄漏段数（仅 whisper 分支可能 >0）
+            fp = None          # 预设分支不下载音轨，清理前据此判断是否有文件需要删除
             if preset and preset.get('segments') is not None:
                 # 批量预转写：已下载并转写好的结果直接组装，不再下载/转写
                 segs = preset['segments']
@@ -983,11 +1013,11 @@ def process_video(a, url_arg, out_path, holder=None, preset=None):
             asr_info['ad_segments'] = ad_count
             route = f'asr:{a.engine}:{a.model if a.engine == "whisper" else meta.get("model")}@{meta["device"]}'
             L += pack_asr_body(engine_label, meta['device'], blocks, ad_hits, ad_count)
-            if not a.keep_audio:
+            if not a.keep_audio and fp:
                 try:
                     os.remove(fp)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f'[警告] 音轨清理失败 {fp}: {e}', file=sys.stderr)
 
     if not a.only_meta and not a.no_comments:
         rs = fetch_comments(V['aid'])
@@ -1012,9 +1042,10 @@ def process_video(a, url_arg, out_path, holder=None, preset=None):
     L[meta_at:meta_at] = pack_meta(meta_info)
 
     text = '\n'.join(L)
-    out = Path(out_path)
+    out = Path(out_path) if out_path else (
+        Path('outputs') / f"bili_{bvid}{'_p' + str(page) if page > 1 else ''}.md")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(text, encoding='utf-8')
+    _atomic_write(out, text)
     res = {'ok': True, 'bvid': bvid, 'title': V['title'], 'up': V['owner']['name'],
            'duration': fmt_dur(pinfo.get('duration') or V['duration']),
            'route': route, 'logged_in': logged_in,
@@ -1053,6 +1084,10 @@ def main():
                 _tid = _p.task_of(it.get('out') or it.get('url')) if _p else None
                 try:
                     url, page, _b = resolve_input(it['url'])
+                    if not _b:
+                        # av 号链接解析不出 BV。下载文件名依赖它，留空会让整批共用同一个
+                        # stem（None_p1），后一条下载会先把前一条的音轨删掉。
+                        _b = fetch_meta(url, page)['bvid']
                     if _p:
                         _p.auto(task=_tid or _p.task_of(url), stage='download',
                                 note='下载音频…')
@@ -1071,7 +1106,7 @@ def main():
                     outcomes.append({'url': it.get('url'), 'out': it.get('out'), 'audio': None,
                                      'error': str(e)})
             if prepped:
-                batch_json = Path(tempfile.gettempdir()) / '_nano_batch.json'
+                batch_json = Path(tempfile.gettempdir()) / f'_nano_batch_{os.getpid()}.json'
                 batch_json.write_text(json.dumps(
                     [{'key': p['out'], 'audio': p['audio']} for p in prepped],
                     ensure_ascii=False), encoding='utf-8')
@@ -1153,9 +1188,7 @@ def main():
     if not a.url:
         print(json.dumps({'ok': False, 'error': '缺少视频链接或 --batch-file'}))
         sys.exit(1)
-    url, page, bvid = resolve_input(a.url)
-    default_out = Path('outputs') / f"bili_{bvid}{'_p'+str(page) if page>1 else ''}.md"
-    r = process_video(a, a.url, a.out or str(default_out))
+    r = process_video(a, a.url, a.out)
     print(json.dumps(r, ensure_ascii=False, indent=2))
 
 

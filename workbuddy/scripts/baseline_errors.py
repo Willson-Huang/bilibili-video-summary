@@ -30,6 +30,28 @@ SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_GLOSSARY = os.path.join(SKILL_DIR, 'references', 'asr_glossary.txt')
 
 SEP = re.compile(r'^\|[\s:|-]+\|$')
+
+
+def read_utf8(path):
+    """读 UTF-8 文本。编码不合法时在 stderr 报出文件名与偏移，并改用替换字符读取。
+
+    返回的文本始终可用，调用方不需要处理异常；非法字节不会被悄悄丢掉。
+    """
+    raw = open(path, 'rb').read()
+    try:
+        return raw.decode('utf-8')
+    except UnicodeDecodeError as e:
+        print('[提醒] %s 不是合法的 UTF-8（偏移 %d 起），已用替换字符读取，'
+              '该文件的统计可能不准' % (path, e.start), file=sys.stderr)
+        return raw.decode('utf-8', 'replace')
+
+
+def write_atomic(path, text):
+    """原子写入：先写同目录临时文件再替换，中断不会留下半截报告。"""
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(text)
+    os.replace(tmp, path)
 LEFT_KEYS = ('原文', 'ASR', '字幕', '转写')
 RIGHT_KEYS = ('应为', '正确', '还原')
 CONF_KEYS = ('置信', '把握')
@@ -116,7 +138,7 @@ def split_cell(cell):
 
 def parse_file(path):
     """返回 (pairs, unresolved_count)。pairs: [(错, 对, 置信, 依据)]"""
-    t = open(path, encoding='utf-8', errors='ignore').read()
+    t = read_utf8(path)
     pairs, unresolved = [], 0
     for ri, ci, rows in iter_tables(t):
         for cells in rows:
@@ -343,7 +365,7 @@ def main():
         return 2
 
     files = [f for f in sorted(glob.glob(os.path.join(a.raw, '*.md')))
-             if '误识对照' in open(f, encoding='utf-8', errors='ignore').read()]
+             if '误识对照' in read_utf8(f)]
     pack_index = {}
     for p in glob.glob(os.path.join(a.subs, '*.md')):
         m = re.search(r'BV[0-9A-Za-z]{10}', os.path.basename(p))
@@ -355,14 +377,14 @@ def main():
 
     rows, unresolved_total, no_pack = [], 0, 0
     for f in files:
-        t = open(f, encoding='utf-8', errors='ignore').read()
+        t = read_utf8(f)
         pairs, unres = parse_file(f)
         unresolved_total += unres
         eng = engine_of(t)
         m = re.search(r'BV[0-9A-Za-z]{10}', t)
         pack = None
         if m and m.group(0) in pack_index:
-            pack = open(pack_index[m.group(0)], encoding='utf-8', errors='ignore').read()
+            pack = read_utf8(pack_index[m.group(0)])
         else:
             no_pack += 1
 
@@ -502,10 +524,9 @@ def main():
 
     dest = a.out or os.path.join(os.getcwd(),
                                  'baseline_errors_report.txt')
-    open(dest, 'w', encoding='utf-8').write('\n'.join(out))
+    write_atomic(dest, '\n'.join(out))
     if a.json:
-        json.dump(rows, open(a.json, 'w', encoding='utf-8'),
-                  ensure_ascii=False, indent=1)
+        write_atomic(a.json, json.dumps(rows, ensure_ascii=False, indent=1))
     print('错误对 %d 个；报告 -> %s' % (n, dest))
     print('\n'.join(out[:32]))
     return 0

@@ -14,7 +14,9 @@
 """
 import hashlib
 import json
+import os
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -31,12 +33,34 @@ MIXIN = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5,
 
 _WBI = None
 
+# 可重试的状态码：412 是 B站的访问频率限制，429 与 5xx 是通用临时错误。
+# 其余状态码（404、403 等）重试没有意义，直接抛出。
+RETRY_STATUS = {412, 429, 500, 502, 503, 504}
+HTTP_RETRIES = int(os.environ.get('BILI_HTTP_RETRIES', '3'))
+HTTP_RETRY_SLEEP = float(os.environ.get('BILI_HTTP_RETRY_SLEEP', '1.5'))
+
 
 def http_json(url, headers=None, timeout=30):
-    """GET 一个 URL 并解析 JSON。headers 缺省时只带 UA。"""
-    req = urllib.request.Request(url, headers=headers or {'User-Agent': UA})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode('utf-8', 'replace'))
+    """GET 一个 URL 并解析 JSON。headers 缺省时只带 UA。
+
+    临时错误按指数退避重试，最多 HTTP_RETRIES 次；重试用尽后抛出，
+    由调用方决定是记失败还是降级。
+    """
+    last = None
+    for attempt in range(HTTP_RETRIES):
+        try:
+            req = urllib.request.Request(url, headers=headers or {'User-Agent': UA})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode('utf-8', 'replace'))
+        except urllib.error.HTTPError as e:
+            if e.code not in RETRY_STATUS:
+                raise
+            last = f'HTTP {e.code}'
+        except urllib.error.URLError as e:
+            last = f'{e.reason}'
+        if attempt < HTTP_RETRIES - 1:
+            time.sleep(HTTP_RETRY_SLEEP * (2 ** attempt))
+    raise RuntimeError(f'请求连续失败 {HTTP_RETRIES} 次（最后一次 {last}）: {url}')
 
 
 def _wbi_clean(v):

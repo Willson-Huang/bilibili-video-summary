@@ -111,6 +111,7 @@
   .b-download,.b-convert{color:var(--blue); border-color:rgba(96,165,250,.36); background:rgba(96,165,250,.1)}
   .b-asr{color:var(--cyan); border-color:rgba(34,211,238,.4); background:rgba(34,211,238,.1)}
   .b-notes{color:var(--violet); border-color:rgba(167,139,250,.42); background:rgba(167,139,250,.11)}
+  .b-transcribed{color:var(--blue); border-color:rgba(96,165,250,.36); background:rgba(96,165,250,.1)}
   .b-done{color:var(--emerald); border-color:rgba(52,211,153,.4); background:rgba(52,211,153,.1)}
   .b-fail{color:var(--rose); border-color:rgba(251,113,133,.42); background:rgba(251,113,133,.1)}
   .note{color:var(--dim); font-size:11.5px; margin-top:5px; white-space:nowrap;
@@ -229,10 +230,11 @@ function fmt(s) {
   if (s === null || s === undefined || isNaN(s)) return '—';
   s = Math.max(0, Math.round(s));
   const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
-  if (h) return `${h}h${String(m).padStart(2, '0')}m`;
+  if (h) return `${h}h${String(m).padStart(2, '0')}m${String(x).padStart(2, '0')}s`;
   return m ? `${m}m${String(x).padStart(2, '0')}s` : `${x}s`;
 }
-const clock = ts => new Date(ts * 1000).toLocaleTimeString('zh-CN', {hour12: false});
+/* hourCycle 固定 h23：部分环境在 hour12:false 下会把 0 点渲染成 24:00:00 */
+const clock = ts => new Date(ts * 1000).toLocaleTimeString('zh-CN', {hourCycle: 'h23'});
 /* 相对时间：绝对时刻一直在跳不等于数据在更新，而“若干秒前”才是可判断的信号 ——
    管线停更时它会持续增长，而不是继续装作在动。 */
 function ago(sec) {
@@ -314,6 +316,7 @@ function renderTasks(tasks) {
     if (!n) { n = makeRow(); nodes.set(t.id, n); }
 
     const st = t.stage || 'queued';
+    n.t = t;            /* 本地时钟推进要读它 —— 漏赋值会让任务行的时间静默不更新 */
     setClass(n.el, 'row ' + rowClass(st));            /* 类名不变则不动，避免动画重启 */
     setText(n.idx, String(i + 1).padStart(2, '0'));
     setText(n.ttl, t.title);
@@ -338,7 +341,7 @@ function renderTasks(tasks) {
     else if (st === 'fail') { setText(n.num, (t.pct || 0).toFixed(0) + '%'); setText(n.sub, '已中断'); }
     else {
       setText(n.num, (t.pct || 0).toFixed(0) + '%');
-      setText(n.sub, fmt(t.elapsed) + (t.eta != null ? ' / 剩 ' + fmt(t.eta) : ''));
+      setText(n.sub, taskTimeText(t, 0));
     }
     /* 顺序与后端一致（列表很短，直接对齐位置即可） */
     const at = list.children[i];
@@ -394,44 +397,91 @@ function renderLog(log) {
     </li>`).join('') || '<li><span class="n" style="color:#8296b8">暂无事件</span></li>';
 }
 
+/* 任务行的时间文案：先「已用」，再「剩」。
+   没有时间依据的阶段只报已用 —— 套用别的阶段的预测比留空更糟。 */
+function taskTimeText(t, driftSec) {
+  const d = driftSec || 0;
+  const used = t.elapsed == null ? null : Math.max(0, t.elapsed + d);
+  const left = t.eta == null ? null : Math.max(0, t.eta - d);
+  const parts = [];
+  if (used != null) parts.push(fmt(used));
+  if (t.overrun && !(left > 0)) parts.push('已超预估');
+  else if (left != null && left > 0) parts.push('剩 ' + fmt(left));
+  /* 实测速率只在算得出来时显示（转写中 = 音频秒数 ÷ 已用秒数）。
+     它解释了这个「预计剩余」是按什么速度推的 —— 比留空更有用，
+     但拿不到速率的阶段不编数字（rich 在 total 未知时显示速度，同理）。 */
+  if (parts.length && Number(t.rate) > 0) parts.push(t.rate.toFixed(1) + 'x');
+  return parts.length ? parts.join(' / ') : '—';
+}
+
+/* 顶部「预计剩余」的四种状态：全部结束 / 已超预估 / 还有任务没有依据 / 正常 */
+function topEtaText(o, d, ended) {
+  if (ended) return '0s';
+  const left = o.eta == null ? null : Math.max(0, o.eta - d);
+  if (left == null) return '—';
+  if (o.overrun && left <= 0) return '已超预估';
+  /* eta_complete=false：还有任务的剩余时间没有依据，给出的一定是下界 */
+  if (o.eta_complete === false) return left > 0 ? '≥ ' + fmt(left) : '—';
+  return fmt(left);
+}
+
 /* ---------- 时间显示：本地时钟驱动 ----------
    服务端只在轮询时给一个采样值（POLL=700ms），而显示粒度是 1 秒，两者不同步；
    直接显示就会出现“停一下、跳两秒”的不均匀节拍（实测观测到的现象）。
    这里把服务端值当基准，之后交给本地时钟按 UI_TICK 平滑推进。
    外推上限 STALE_CAP：数据停更时冻结在最后值，不把“卡住”演成“还在跑”。 */
-const UI_TICK = 250, STALE_CAP = 5, STALE_WARN = 10, STALE_BAD = 30;
+/* 刷新节流：rich 的 TimeRemainingColumn 用 0.5s，理由同样是「防抖动」。
+   我们的过期判定是 10s/30s 量级，250ms 对它是浪费。 */
+const UI_TICK = 500;
 let base = {at: 0, o: null, run: null};      /* at = 收到数据的本地时刻 */
-const dataAge = () => base.at ? Math.max(0, (Date.now() - base.at) / 1000) : 0;
-const drift = () => Math.min(dataAge(), STALE_CAP);
+/* 过期阈值由服务端下发，前端只留兜底 —— 它们与上报频率耦合，
+   换引擎或改上报间隔时要能一处改完（此前服务端与前端各写一份，靠注释对齐）。 */
+const STALE_FALLBACK = {stale_cap: 5, stale_warn: 10, stale_bad: 30};
+const cfg = k => {
+  const v = Number((base.o || {})[k]);
+  return Number.isFinite(v) && v > 0 ? v : STALE_FALLBACK[k];
+};
+const sinceRecv = () => base.at ? Math.max(0, (Date.now() - base.at) / 1000) : 0;
+/* 数据停更了多少秒：服务端算的「距最后一条事件多久」 */
+const staleSec = () => Math.max(0, Number((base.o || {}).stale_sec) || 0);
+/* 数据龄 = 服务端的数据龄 + 收到之后本地经过的时间。
+   只看本地收包时刻是错的 —— 轮询成功不等于管线有产出，
+   那样管线卡住也会一直显示「刚刚」，两档着色永远不触发。 */
+const dataAge = () => staleSec() + sinceRecv();
+/* 外推额度：只补两次轮询之间的零头。服务端已把基准截在「最后一条事件 + 5 秒」，
+   这里同步收口，停更后不再外推，避免把「卡住」演成「还在跑」。 */
+const drift = () => Math.min(sinceRecv(), cfg('stale_cap'),
+                              Math.max(0, cfg('stale_cap') - staleSec()));
 
 function paintTopTimes() {
   const o = base.o;
   if (!o) return;
   const d = drift(), age = dataAge(), sub = $('sub');
   setText($('sElapsed'), fmt((o.elapsed ?? 0) + d));
-  setText($('sEta'), (o.total && o.done === o.total) ? '0s'
-                  : fmt(o.eta == null ? null : Math.max(0, o.eta - d)));
+  setText($('sEta'), topEtaText(o, d, !!(o.total && (o.done + o.failed) === o.total)));
+  const src = o.rate_src === 'observed' ? '实测'
+            : o.rate_src === 'batch' ? '批量参考' : '单条';
+  const h = o.rate_history;              /* 跨批次历史：只显示，不参与计算 */
   setText(sub, `${o.total} 个任务 · 引擎 ${(base.run || {}).engine || '—'}`
+             + (o.rate ? ` · 倍率 ${o.rate.toFixed(1)}x ${src}` : '')
+             + (h && h.n ? `（历史 ${h.median.toFixed(1)}x / ${h.n} 条）` : '')
              + ` · 最后更新 ${ago(age)}`);
   /* 后台标签页会被浏览器降频，那时“多久没更新”不代表任何问题，不着色 */
   const lvl = document.hidden ? 0
-            : age >= STALE_BAD ? 2 : age >= STALE_WARN ? 1 : 0;
+            : age >= cfg('stale_bad') ? 2 : age >= cfg('stale_warn') ? 1 : 0;
   setClass(sub, 'sub' + (lvl === 2 ? ' stale-bad' : lvl === 1 ? ' stale-warn' : ''));
   if (o.updated) sub.title = '数据时刻 ' + clock(o.updated);
 }
 
 /* 任务行的时间同理；终态（done/fail）不参与外推，冻结在事件里记录的真实耗时 */
 function paintTaskTimes() {
+  const d = drift();
   for (const n of nodes.values()) {
     const t = n.t;
     if (!t) continue;
     if (t.stage === 'done') setText(n.sub, fmt(t.elapsed));
     else if (t.stage === 'fail') setText(n.sub, '已中断');
-    else {
-      const e = t.elapsed == null ? null : t.elapsed + drift();
-      const x = t.eta == null ? null : Math.max(0, t.eta - drift());
-      setText(n.sub, fmt(e) + (x != null ? ' / 剩 ' + fmt(x) : ''));
-    }
+    else setText(n.sub, taskTimeText(t, d));
   }
 }
 

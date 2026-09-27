@@ -79,8 +79,14 @@ def main():
         results = []
         code = 0
         for job in jobs:
-            r = upload_one(job['file'], job['cos_credential'], job.get('media_id', ''))
-            results.append({'file': job['file'], **r})
+            try:
+                r = upload_one(job['file'], job['cos_credential'], job.get('media_id', ''))
+            except Exception as e:
+                # 单条失败不能中断整批：后面的文件还要传，且调用方按顺序读结果
+                r = {'ok': False, 'status': 0, 'host': '',
+                     'etag': f'{type(e).__name__}: {e}',
+                     'media_id': job.get('media_id', ''), 'size': 0}
+            results.append({'file': job.get('file'), **r})
             if not r['ok']:
                 code = 1
         print(json.dumps(results, ensure_ascii=False, indent=2))
@@ -155,10 +161,6 @@ def upload_one(file_path, cred, media_id):
         except urllib.error.URLError as e:
             print(f'  [try] {host} -> {e.reason}', file=sys.stderr)
             last = (0, f'{e.reason}', host)
-        else:
-            if not (200 <= last[0] < 300):
-                print(f'  [try] {host} -> HTTP {last[0]} {last[1][:200]}',
-                      file=sys.stderr)
 
     status, body, host = last
     ok = 200 <= status < 300
@@ -167,4 +169,12 @@ def upload_one(file_path, cred, media_id):
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        # 顶层兜底：异常也要输出约定好的 JSON，调用方才能解析
+        print(json.dumps({'ok': False, 'error': f'{type(e).__name__}: {e}'},
+                         ensure_ascii=False))
+        sys.exit(1)

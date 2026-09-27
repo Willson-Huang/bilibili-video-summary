@@ -81,13 +81,17 @@ def load(csv_path):
 
 
 def save(csv_path, rows):
+    """整表重写台账。先写同目录临时文件再替换：这里每处理一条就重写一次，
+    中途中断会留下半截 CSV，而下次读取会把半截当成完整台账。"""
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(csv_path, 'w', encoding='utf-8-sig', newline='') as f:
+    tmp = csv_path.with_name(csv_path.name + '.tmp')
+    with open(tmp, 'w', encoding='utf-8-sig', newline='') as f:
         w = csv.DictWriter(f, fieldnames=COLS)
         w.writeheader()
         for i, r in enumerate(rows, 1):
             r['序号'] = str(i)
             w.writerow({k: r.get(k, '') for k in COLS})
+    os.replace(tmp, csv_path)
 
 
 def init_csv(csv_path):
@@ -129,7 +133,8 @@ def show_status(csv_path):
               f"{r.get('UP主') or '-':16s} {(r.get('视频标题') or r.get('视频链接') or '-')[:40]}")
 
 
-def process(csv_path, do_transcribe, limit, only_bvid, model, engine='whisper', hotwords=None):
+def process(csv_path, do_transcribe, limit, only_bvid, model, engine='whisper', hotwords=None,
+            retry_failed=False):
     rows = load(csv_path)
     if not rows:
         print('台账为空，先跑 --init 或手动粘贴链接')
@@ -148,7 +153,8 @@ def process(csv_path, do_transcribe, limit, only_bvid, model, engine='whisper', 
         # 已转写的行不重复转写：等 AI 写完纪要再收尾，避免白白重跑 ASR
         if st == ST_TRANSCRIBED:
             continue
-        if st.startswith('失败'):
+        # 失败行默认跳过；--retry-failed 才重新纳入（网络抖动造成的失败本来可以再试）
+        if st.startswith('失败') and not retry_failed:
             continue
         targets.append((idx, r))
 
@@ -166,13 +172,14 @@ def process(csv_path, do_transcribe, limit, only_bvid, model, engine='whisper', 
     notes_dir.mkdir(parents=True, exist_ok=True)
 
     tmp_dir = Path(tempfile.gettempdir())
+    probe = tmp_dir / f'_bili_meta_probe_{os.getpid()}.md'
 
     for n, (idx, r) in enumerate(targets, 1):
         link = r['视频链接'].strip()
         print(f'--- [{n}/{len(targets)}] {link}')
         t0 = time.time()
         try:
-            meta = run_bili([link, '--only-meta', '--out', str(tmp_dir / '_bili_meta_probe.md')])
+            meta = run_bili([link, '--only-meta', '--out', str(probe)])
             bvid = meta['bvid']
             rows[idx]['BV号'] = bvid
             rows[idx]['UP主'] = meta['up']
@@ -210,6 +217,11 @@ def process(csv_path, do_transcribe, limit, only_bvid, model, engine='whisper', 
         save(csv_path, rows)
         print(f'    台账已更新（{round(time.time() - t0)}s）\n')
 
+    try:
+        probe.unlink(missing_ok=True)      # 探针文件含标题与简介，跑完即删
+    except Exception:
+        pass
+
     print('本轮处理结束，状态：')
     show_status(csv_path)
 
@@ -221,6 +233,8 @@ def main():
     ap.add_argument('--status', action='store_true')
     ap.add_argument('--meta-only', action='store_true')
     ap.add_argument('--limit', type=int, default=0)
+    ap.add_argument('--retry-failed', action='store_true',
+                    help='把状态为「失败:<原因>」的行也纳入本次处理；默认跳过')
     ap.add_argument('--bvid', default=None)
     ap.add_argument('--model', default='large-v3-turbo')
     ap.add_argument('--engine', default='whisper', choices=['whisper', 'funasr-nano'],
@@ -235,7 +249,8 @@ def main():
         show_status(csv_path)
     else:
         process(csv_path, not a.meta_only, a.limit, a.bvid, a.model,
-                getattr(a, 'engine', 'whisper'), getattr(a, 'hotwords', None))
+                getattr(a, 'engine', 'whisper'), getattr(a, 'hotwords', None),
+                a.retry_failed)
 
 
 if __name__ == '__main__':

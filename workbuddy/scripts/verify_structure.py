@@ -29,6 +29,24 @@ REQUIRED_FM = ['title', 'date', 'type', 'source', 'tags', 'entities',
                'confidence', 'review_by']
 
 
+def _yaml_list(block, key):
+    """取 frontmatter 里某个列表字段的条目，返回 (条目列表, 形态)。
+
+    形态 inline  = 写在同一行的 [a, b, c]
+    形态 block   = 另起缩进行，形如 tags: 换行后跟 '  - a'
+    形态 missing = 两种写法都匹配不到。这时必须出声，否则粒度要求会被静默跳过。
+    """
+    m = re.search(rf'^{key}:\s*\[(.*?)\]', block, re.M)
+    if m:
+        return [x.strip() for x in m.group(1).split(',') if x.strip()], 'inline'
+    m = re.search(rf'^{key}:[ \t]*\r?\n((?:[ \t]+-.*\r?\n?)+)', block, re.M)
+    if m:
+        items = [ln.strip()[1:].strip() for ln in m.group(1).splitlines()
+                 if ln.strip().startswith('-')]
+        return [x for x in items if x], 'block'
+    return [], 'missing'
+
+
 def check(path: Path):
     """返回 (errors, warnings, 节数, tags数, entities数)
 
@@ -49,18 +67,16 @@ def check(path: Path):
                 if not re.search(rf'^{k}:\s*\S', block, re.M)]
         if miss:
             errors.append(f'frontmatter 缺字段: {", ".join(miss)}')
-        # tags
-        m = re.search(r'^tags:\s*\[(.*?)\]', block, re.M)
-        tags = [x.strip() for x in m.group(1).split(',') if x.strip()] if m else []
-        tags_n = len(tags)
-        if m and not (6 <= tags_n <= 10):
-            warnings.append(f'tags {tags_n} 个（指引 6-10）')
-        # entities
-        m = re.search(r'^entities:\s*\[(.*?)\]', block, re.M)
-        ents = [x.strip() for x in m.group(1).split(',') if x.strip()] if m else []
-        ent_n = len(ents)
-        if m and not (8 <= ent_n <= 12):
-            warnings.append(f'entities {ent_n} 个（指引 8-12）')
+        tags_items, tags_style = _yaml_list(block, 'tags')
+        ent_items, ent_style = _yaml_list(block, 'entities')
+        tags_n, ent_n = len(tags_items), len(ent_items)
+        for key, style, n, lo, hi in (('tags', tags_style, tags_n, 6, 10),
+                                      ('entities', ent_style, ent_n, 8, 12)):
+            if style == 'missing':
+                warnings.append(f'{key} 读不出条目（既不是内联数组也不是块状列表），'
+                                f'本项无法校验')
+            elif not (lo <= n <= hi):
+                warnings.append(f'{key} {n} 个（指引 {lo}-{hi}）')
 
     # 3. 14 节
     heads = re.findall(r'^##\s*(.+)$', t, re.M)
@@ -95,8 +111,6 @@ def main():
     else:
         print('用法: python verify_structure.py <文件...>  |  --dir <目录>')
         sys.exit(2)
-
-    VIDEO_TYPES = ['播客访谈纪要', '知识科普', '评论解说', '教程演示', '圆桌对谈']
 
     bad = warn_n = skip = 0
     rows = []

@@ -20,6 +20,8 @@ venv 里装包。本方案零依赖、样式自由，且能同时承载转写与
   python progress_hub.py --init --tasks tasks.json --title "批次二"
   python progress_hub.py --serve --port 8765 --open
   python progress_hub.py --emit --task BV1xxx --stage asr --pct 42.5
+  python progress_hub.py --emit --task BV1xxx --stage notes --note 生成纪要中
+  python progress_hub.py --emit --task BV1xxx --stage done --elapsed 812.4
   python progress_hub.py --compact            # 折叠历史事件，退役旧文件
   python progress_hub.py --reset              # 清空
 
@@ -41,22 +43,65 @@ DEFAULT_DIR = Path(os.environ.get(
     'BILI_PROGRESS_DIR',
     str(Path.home() / 'obsidian' / 'progress' / 'current')))
 
-STAGES = ['queued', 'download', 'convert', 'asr', 'notes', 'done', 'fail']
 STAGE_LABEL = {
     'queued': '排队', 'download': '下载音频', 'convert': '转码',
-    'asr': '转写中', 'notes': '生成纪要', 'done': '已完成', 'fail': '失败',
+    'asr': '转写中', 'transcribed': '待生成纪要', 'notes': '生成纪要',
+    'done': '已完成', 'fail': '失败',
 }
+# 阶段序：只允许向前推进，迟到的旧阶段事件不会把显示拉回去。
+# done 与 fail 同阶。转写脚本只发到 transcribed，「已完成」由写完纪要的一方发出 ——
+# 若让转写脚本直接发 done，终态锁会把后到的 notes 吞掉，看板会提前宣布完成。
+STAGE_RANK = {'queued': 0, 'download': 1, 'convert': 2, 'asr': 3,
+              'transcribed': 4, 'notes': 5, 'done': 8, 'fail': 8}
 TERMINAL = ('done', 'fail')
-# 转写倍率：把「已用时间」换算成百分比（见 references/perf-benchmark-2026-09-13.md）
+# 进行中阶段：这些阶段的「已用时间」可以从事件时刻外推
+ACTIVE_STAGES = ('download', 'convert', 'asr', 'notes')
+# 停更超过该秒数就不再外推时间（前端用同一个值，见 dashboard.html 的 STALE_CAP）
+STALE_CAP_SEC = 5.0
+# 转写倍率常量：按单条标定（见 references/perf-benchmark-2026-09-13.md）。
+# 批量实测只有约 2.1x，照常量推算会把「预计剩余」压到 0，故仅在样本不足时兜底。
 RTF = {'funasr-nano': 5.08, 'whisper': 19.2}
 DEFAULT_RTF = 5.08
+# 自适应倍率：从「转写完成」事件推算「音频秒数 ÷ 实际耗时秒数」，样本达到该数才采用
+RTF_MIN_SAMPLES = 2
+# 批量兜底倍率：单条标定值在批量下偏乐观（实测 5 条 / 3225.5 秒音频 / 1555 秒 ≈ 2.1x）。
+# 只在「音频任务 ≥ BATCH_AUDIO_MIN 条」且尚无实测样本时使用；有样本后一律以实测为准。
+RTF_BATCH_FALLBACK = 2.1
+BATCH_AUDIO_MIN = 2
+# 倍率的指数平滑系数：与 tqdm 的 EMA 同源（它默认 0.3）。转写耗时受音频长度与内容
+# 影响，波动比逐条迭代的任务大，需要更平滑时可下调到 0.2。
+RTF_EMA_ALPHA = 0.3
+# 各阶段的预期心跳间隔（秒）：该阶段内这么久没有事件属于正常。
+# 过期阈值由它推出（转黄 = 心跳，转红 = 3 倍心跳）并随状态下发给前端。
+# 「生成纪要」由主 agent 在写完时上报一次，中间几分钟没有事件是正常的，
+# 沿用单一阈值会让它一直被标成过期。
+STAGE_HEARTBEAT = {
+    'queued': 30, 'download': 10, 'convert': 10, 'asr': 10,
+    'transcribed': 300, 'notes': 300, 'done': 3600, 'fail': 3600,
+}
+# 兜底阈值（秒）：阶段不在上表里时使用，前端也保留同一组兜底值
+STALE_WARN_SEC = 10
+STALE_BAD_SEC = 30
+
+
+def stale_thresholds(stage):
+    """按阶段给出 (转黄秒数, 转红秒数)；阶段未知时用兜底值。"""
+    hb = STAGE_HEARTBEAT.get(stage)
+    if not hb:
+        return STALE_WARN_SEC, STALE_BAD_SEC
+    return hb, hb * 3
+# 跨批次历史：只用来在顶部并排显示「本批实测 vs 历史中位」，不参与计算
+RTF_HISTORY_FILE = 'rtf_history.jsonl'
+RTF_HISTORY_MAX = 50
+# 事件角色（借 LSP Work Done Progress 的三段式）。**纯附加元信息**：
+# 状态仍从事件内容推导，不依赖事件顺序，乱序容错保持不变。
+KINDS = ('begin', 'report', 'end')
 
 # 退役文件在「无人写入」超过该秒数后才允许删除（避免删掉仍持有句柄的活文件）
 COMPACT_SAFE_AGE = 300
 
-# 看板默认端口；端口被占用时会向后回退（回退结果记在 hub.json 里供探测）
+# 看板端口：一次探测只认「hub.json 里记录的实际端口」，不做端口段扫描
 DEFAULT_PORT = 8765
-PORT_SPAN = 24
 # 服务启动时把实际端口写这里，供 ensure_serving 一次探测就定位（避免端口扫描）
 HUB_STATE = 'hub.json'
 
@@ -99,19 +144,42 @@ def _events_file(d):
 # --------------------------------------------------------------------------- #
 # 写入端
 # --------------------------------------------------------------------------- #
+def _engine_of(d):
+    """取运行目录里登记的引擎名（run.json 的 engine）；取不到给默认值。"""
+    try:
+        p = run_dir(d) / 'run.json'
+        if p.is_file():
+            v = json.loads(p.read_text(encoding='utf-8')).get('engine')
+            if v:
+                return str(v)
+    except Exception:
+        pass
+    return 'funasr-nano'
+
+
 def emit(task=None, stage=None, pct=None, title=None, up=None, duration_sec=None,
-         elapsed=None, note=None, src=None, group=None, d=None, **extra):
-    """追加一条进度事件。**永不抛异常** —— 进度上报绝不能拖垮主流程。"""
+         elapsed=None, note=None, src=None, group=None, kind=None, d=None, **extra):
+    """追加一条进度事件。**永不抛异常** —— 进度上报绝不能拖垮主流程。
+
+    kind 是可选的事件角色（begin / report / end），借 LSP 的 Work Done Progress：
+    它只让事件流自描述，**不参与状态推导** —— 状态仍从事件内容算，乱序容错不变。
+    取值不在 KINDS 里就当没传（静默丢弃，不报错）。
+    """
     try:
         d = run_dir(d)
         ev = {'ts': time.time(), 'task': task, 'stage': stage, 'pct': pct,
               'title': title, 'up': up, 'duration_sec': duration_sec,
               'elapsed': elapsed, 'note': note, 'group': group,
+              'kind': kind if kind in KINDS else None,
               'src': src or Path(sys.argv[0]).stem, 'pid': os.getpid()}
         ev = {k: v for k, v in ev.items() if v is not None}
         ev.update(extra)
         with open(_events_file(d), 'a', encoding='utf-8') as f:
             f.write(json.dumps(ev, ensure_ascii=False) + '\n')
+        # 转写完成的事件同时带着音频时长与实际耗时 —— 顺手记一条跨批次样本。
+        # 记在这里而不是轮询侧：轮询是只读的，而这里是「每个任务正好一次」的时机。
+        if stage == 'transcribed' and duration_sec and elapsed and elapsed > 0:
+            _record_rtf_history(d, _engine_of(d), float(duration_sec) / float(elapsed))
         return True
     except Exception:
         return False
@@ -133,15 +201,178 @@ def auto(task=None, stage=None, pct=None, group=None, **kw):
         return False
 
 
-def pct_from_elapsed(elapsed, duration_sec, engine='funasr-nano', cap=97.0):
-    """按「已用时间 / 预测耗时」估算百分比，用于没有细粒度回调的阶段。"""
+def pct_from_elapsed(elapsed, duration_sec, engine='funasr-nano', cap=97.0,
+                     rate=None):
+    """按「已用时间 / 预测耗时」估算百分比，用于没有细粒度回调的阶段。
+
+    rate 给定时用它替代常量 —— 常量按单条标定，批量实测慢得多，
+    照常量算会在转写中途直接顶到 cap（表现为「97% 且剩 0s」）。
+    """
     try:
-        pred = float(duration_sec) / RTF.get(engine, DEFAULT_RTF)
+        r = float(rate) if rate else RTF.get(engine, DEFAULT_RTF)
+        pred = float(duration_sec) / r
         if pred <= 0:
             return None
         return round(min(cap, max(0.0, elapsed / pred * 100.0)), 1)
     except Exception:
         return None
+
+
+def _ema(values, alpha=RTF_EMA_ALPHA):
+    """一阶指数平滑 + 误差修正，返回最后一个平滑值。
+
+    算式与 tqdm 的 EMA 同源：last = a·x + (1-a)·last，再除以 (1-(1-a)^n)。
+    分母把前几个样本从初值 0 拉回来（否则头两条会偏小）。它给近期样本更高的
+    权重，所以「批次突然变慢」比中位数反映得更快 —— 这也是换掉中位数的原因。
+    """
+    last, n = 0.0, 0
+    for x in values:
+        last = alpha * x + (1 - alpha) * last
+        n += 1
+    if not n:
+        return None
+    return last / (1 - (1 - alpha) ** n)
+
+
+def _median(values):
+    s = sorted(values)
+    mid = len(s) // 2
+    return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
+
+
+def rtf_samples(d=None):
+    """按时间顺序取「转写完成」事件的倍率样本（音频秒数 ÷ 实际耗时秒数）。
+
+    取样点必须落在**转写结束**那一刻：那时的事件同时带着音频时长与实际耗时。
+    不能拿终态任务的 elapsed —— 转写结束后还有生成纪要，
+    而阶段切换时已用时间会重新起算，用它当样本会把倍率算小。
+    """
+    try:
+        d = run_dir(d)
+        _, events = _load_raw(d)          # 已按 ts 排序；顺序对 EMA 是必需的
+        out = []
+        for e in events:
+            if e.get('stage') != 'transcribed':
+                continue
+            dur, el = e.get('duration_sec'), e.get('elapsed')
+            if dur and el and el > 0:
+                out.append(float(dur) / float(el))
+        return out
+    except Exception:
+        return []
+
+
+def observed_rtf(d=None, min_samples=RTF_MIN_SAMPLES):
+    """本批实测倍率：对样本按时间顺序做指数平滑。样本不足返回 None。
+
+    常量 5.08 按单条标定，批量实测只有约 2.1；照常量推算会让「预计剩余」
+    在批量场景下直接归零。样本不足时由 effective_rtf() 兜底。
+    """
+    s = rtf_samples(d)
+    if len(s) < min_samples:
+        return None
+    v = _ema(s)
+    return round(v, 3) if v else None
+
+
+def load_rtf_history(d=None, engine=None):
+    """读跨批次的历史倍率样本（只读，失败返回空表）。
+
+    历史**不参与计算**，只用于在顶部把「本批实测」与「历史中位」并排显示，
+    让人自己判断本批是否异常（换机器 / 换模型版本 / GPU 被占用）。
+    与 Airflow 的 Task Duration 视图同一个思路：给参照，不做自动采用。
+    """
+    try:
+        p = run_dir(d).parent / RTF_HISTORY_FILE
+        if not p.is_file():
+            return {}
+        vals = []
+        for line in p.read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if engine and o.get('engine') != engine:
+                continue
+            r = o.get('rate')
+            if isinstance(r, (int, float)) and r > 0:
+                vals.append(float(r))
+        if not vals:
+            return {}
+        vals = vals[-RTF_HISTORY_MAX:]
+        return {'n': len(vals), 'median': round(_median(vals), 3)}
+    except Exception:
+        return {}
+
+
+def _record_rtf_history(d, engine, rate):
+    """把一个样本追加进跨批次历史（append-only，一行一条）。
+
+    为什么用 jsonl 而不是 json 字典：上报方是多进程，读改写会有丢更新；
+    追加一行更安全，且与事件文件同一套思路。**只写引擎名与倍率两个数** ——
+    不写素材名也不写时长，避免把内容信息带到一个会被复用的位置。
+    """
+    try:
+        if not (isinstance(rate, (int, float)) and rate > 0):
+            return
+        p = run_dir(d).parent / RTF_HISTORY_FILE
+        with open(p, 'a', encoding='utf-8') as f:
+            f.write(json.dumps({'engine': engine or 'funasr-nano',
+                                'rate': round(float(rate), 4),
+                                'ts': round(time.time(), 1)},
+                               ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
+def trim_rtf_history(d=None, keep=RTF_HISTORY_MAX, dry=False):
+    """把跨批次历史裁到每引擎最近 keep 条（append-only 文件会一直长）。"""
+    try:
+        p = run_dir(d).parent / RTF_HISTORY_FILE
+        if not p.is_file():
+            return {'before': 0, 'after': 0}
+        rows = [ln.strip() for ln in p.read_text(encoding='utf-8').splitlines() if ln.strip()]
+        by_engine = {}
+        for ln in rows:
+            try:
+                eng = json.loads(ln).get('engine') or 'funasr-nano'
+            except Exception:
+                eng = 'funasr-nano'
+            by_engine.setdefault(eng, []).append(ln)
+        kept = []
+        for eng in sorted(by_engine):
+            kept += by_engine[eng][-keep:]
+        if not dry and len(kept) != len(rows):
+            tmp = p.with_name(p.name + '.tmp')
+            tmp.write_text('\n'.join(kept) + '\n', encoding='utf-8')
+            os.replace(tmp, p)
+        return {'before': len(rows), 'after': len(kept)}
+    except Exception:
+        return {'before': 0, 'after': 0}
+
+
+def effective_rtf(d=None, engine='funasr-nano'):
+    """当前该用的转写倍率，返回 (倍率, 来源)。
+
+    来源三档，越靠前越可信：observed（本批实测）→ batch（批量兜底）→ constant（单条常量）。
+    前端会把来源显示出来 —— 让人知道这个「预计剩余」是按什么算的。
+    """
+    obs = observed_rtf(d)
+    if obs:
+        return obs, 'observed'
+    try:
+        d = run_dir(d)
+        run, events = _load_raw(d)
+        tasks = _fold_tasks(run, events)[0]
+        audio = sum(1 for t in tasks.values() if t.get('duration_sec'))
+        if audio >= BATCH_AUDIO_MIN:
+            return RTF_BATCH_FALLBACK, 'batch'
+    except Exception:
+        pass
+    return RTF.get(engine, DEFAULT_RTF), 'constant'
 
 
 def init_run(tasks, title='任务批次', d=None, meta=None, merge=True, group=None):
@@ -199,7 +430,7 @@ def _signature(d):
     for p in sorted(d.glob('*.json')) + sorted(d.glob('*.jsonl')):
         try:
             st = p.stat()
-            sig.append((p.name, st.st_size, int(st.st_mtime * 1000)))
+            sig.append((p.name, st.st_size, st.st_mtime_ns))
         except OSError:
             continue
     return tuple(sig)
@@ -271,11 +502,8 @@ def _load_raw(d):
 # --------------------------------------------------------------------------- #
 # 读取端：折叠成看板状态
 # --------------------------------------------------------------------------- #
-def snapshot(d=None):
-    """把 run.json + 事件折叠成看板要的状态。"""
-    d = run_dir(d)
-    run, events = _load_raw(d)
-
+def _fold_tasks(run, events):
+    """把任务清单与事件流折叠成 {任务ID: 状态} 与出现顺序。"""
     tasks, order = {}, []
     for t in run.get('tasks', []):
         tid = t.get('id') or t.get('task')
@@ -300,8 +528,12 @@ def snapshot(d=None):
                 t[k] = e[k]
         stage = e.get('stage')
         if stage:
-            # 终态不回退（done/fail 之后同任务不再被后续事件覆盖）
-            if t.get('stage') not in TERMINAL:
+            # 按阶段序推进：迟到的旧阶段事件（如 done 之后又到的 asr）不会把显示拉回去
+            if STAGE_RANK.get(stage, 0) >= STAGE_RANK.get(t.get('stage'), 0):
+                if stage != t.get('stage'):
+                    # 进入新阶段：已用时间重新起算，沿用上一阶段的耗时是误导
+                    t['stage_since'] = e['ts']
+                    t.pop('elapsed', None)
                 t['stage'] = stage
         pct = e.get('pct')
         if isinstance(pct, (int, float)):
@@ -316,41 +548,80 @@ def snapshot(d=None):
             t['started'] = e['started']
         if e.get('note'):
             t['log'].append({'ts': e['ts'], 'note': e['note'], 'stage': stage,
-                             'src': e.get('src')})
+                             'kind': e.get('kind'), 'src': e.get('src')})
+        if e.get('kind'):
+            t['last_kind'] = e['kind']        # 仅用于展示，不参与状态推导
         t['last_ts'] = e['ts']
+    return tasks, order
+
+
+def snapshot(d=None):
+    """把 run.json + 事件折叠成看板要的状态。"""
+    d = run_dir(d)
+    run, events = _load_raw(d)
+    tasks, order = _fold_tasks(run, events)
 
     now = time.time()
+    # 数据时刻 = 最后一条事件的时刻（不是快照时刻）。停更判定必须基于它，
+    # 否则「轮询成功」会被当成「数据在更新」，管线卡住也会一直显示「刚刚」。
+    data_ts = max([e.get('ts') or 0 for e in events] + [run.get('created') or 0])
+    stale_sec = max(0.0, now - data_ts) if data_ts else 0.0
+    # 停更超过 STALE_CAP_SEC 之后不再外推：管线崩了数字不该继续涨
+    eff_now = min(now, data_ts + STALE_CAP_SEC) if data_ts else now
+    # 当前阶段 = 最近有事件的任务所在阶段；过期阈值按它取
+    cur_stage, newest = None, -1.0
+    for t in tasks.values():
+        ts = t.get('last_ts') or 0
+        if ts > newest:
+            newest, cur_stage = ts, (t.get('stage') or 'queued')
+    stale_warn, stale_bad = stale_thresholds(cur_stage)
+    # 倍率：本批实测优先 → 批量兜底 → 单条常量（来源一并报给前端）
+    rate, rate_src = effective_rtf(d, run.get('engine') or 'funasr-nano')
     rows = []
     for tid in order:
         t = tasks[tid]
         st = t.get('stage') or 'queued'
         dur = t.get('duration_sec') or 0
         engine = t.get('engine') or run.get('engine') or 'funasr-nano'
-        # 有音频时长就按时长÷实测倍率推算；非音频任务（如 wiki 编译）直接用自带的 pred_sec
-        pred = t.get('pred_sec') or (dur / RTF.get(engine, DEFAULT_RTF) if dur else None)
+        # 有音频时长就按时长÷倍率推算；非音频任务（如 wiki 编译）直接用自带的 pred_sec
+        if t.get('pred_sec'):
+            pred = t['pred_sec']
+        elif dur:
+            pred = dur / rate
+        else:
+            pred = None
 
+        # 已用时间 = 当前阶段的已用秒数（阶段切换时归零，见 _fold_tasks）
         if st in TERMINAL:
-            # 终态必须冻结：不能用 now - started，否则「已完成」的耗时还在无限增长
+            # 终态必须冻结：不能用 eff_now - started，否则「已完成」的耗时还在涨
             elapsed = t.get('elapsed')
             if elapsed is None:
                 if t.get('started') and t.get('last_ts'):
                     elapsed = t['last_ts'] - t['started']
                 else:
                     elapsed = pred
-        elif t.get('started'):
-            elapsed = now - t['started']
-        else:
+        elif st == 'asr':
+            ref = t.get('started') or t.get('stage_since')
+            elapsed = (eff_now - ref) if ref else t.get('elapsed')
+        elif st in ACTIVE_STAGES:
+            ref = t.get('stage_since')
+            elapsed = (eff_now - ref) if ref else t.get('elapsed')
+        else:                       # queued / transcribed：等待态，不外推
             elapsed = t.get('elapsed')
 
-        eta = None
+        # 预计剩余：只有「转写中」和「还没开始」两种情形有依据。
+        # 下载 / 转码 / 生成纪要都没有各自的实测样本，宁可不给数字，
+        # 也不套用转写的预测值（那是别的阶段的时间）。
+        eta, overrun = None, False
         if st == 'done':
             pct, eta = 100.0, 0.0
         else:
             pct = t.get('pct') or 0.0
-            if st == 'asr' and pred and elapsed is not None:
+            if pred and st == 'asr' and elapsed is not None:
                 eta = max(0.0, pred - elapsed)
-            elif pred is not None:
-                eta = pred * (1 - pct / 100.0)
+                overrun = elapsed >= pred
+            elif pred and st == 'queued':
+                eta = pred
 
         rows.append({
             'id': tid, 'title': t.get('title') or tid, 'up': t.get('up'),
@@ -359,6 +630,12 @@ def snapshot(d=None):
             'pct': round(pct, 1), 'pred_sec': round(pred, 1) if pred else None,
             'elapsed': round(elapsed, 1) if elapsed else None,
             'eta': round(eta, 1) if eta is not None else None,
+            'overrun': bool(overrun),
+            # 转写中的实测速率（音频秒数 ÷ 已用秒数）：只有这一阶段能算出来。
+            # 前端用它解释「这个预计剩余是按什么速度推的」；算不出来就不给。
+            'rate': (round(float(dur) / float(elapsed), 2)
+                     if st == 'asr' and dur and elapsed and elapsed > 0 else None),
+            'kind': t.get('last_kind'),
             'note': (t['log'][-1]['note'] if t['log'] else None),
             'engine': engine,
         })
@@ -367,13 +644,17 @@ def snapshot(d=None):
     done = sum(1 for r in rows if r['stage'] == 'done')
     failed = sum(1 for r in rows if r['stage'] == 'fail')
     active = [r for r in rows if r['stage'] not in ('done', 'fail', 'queued')]
-    weights = [(r['pred_sec'] or 60.0) for r in rows]
+    # 总进度的分母排除失败行：失败行会残留中断时的百分比，
+    # 算进分母就永远到不了 100%（同屏出现「80% + 已完成 2/3 + 剩 0s」）
+    progresses = [r for r in rows if r['stage'] != 'fail']
+    weights = [(r['pred_sec'] or 60.0) for r in progresses]
     wsum = sum(weights) or 1.0
-    overall = sum(w * (r['pct'] / 100.0) for w, r in zip(weights, rows)) / wsum * 100
-    remaining = sum((r['pred_sec'] or 0) * (1 - r['pct'] / 100.0)
-                    for r in rows if r['stage'] not in TERMINAL)
+    overall = sum(w * (r['pct'] / 100.0) for w, r in zip(weights, progresses)) / wsum * 100
+    open_rows = [r for r in rows if r['stage'] not in TERMINAL]
+    remaining = sum((r['pred_sec'] or 0) * (1 - r['pct'] / 100.0) for r in open_rows)
     log = [{'ts': e['ts'], 'task': e.get('task'), 'stage': e.get('stage'),
             'stage_label': STAGE_LABEL.get(e.get('stage'), e.get('stage')),
+            'kind': e.get('kind'),
             'note': e.get('note') or (e.get('title') or ''), 'src': e.get('src')}
            for e in events if e.get('note') or e.get('stage')][-14:]
 
@@ -400,7 +681,22 @@ def snapshot(d=None):
         'overall': {
             'pct': round(overall, 2), 'total': total, 'done': done, 'failed': failed,
             'active': len(active), 'eta': round(remaining, 1) if total else None,
-            'updated': now, 'elapsed': round(now - (run.get('created') or now), 1),
+            # eta_complete=False：还有任务没有可用的时间依据，前端应标注为「≥」
+            'eta_complete': all(r['eta'] is not None for r in open_rows),
+            'overrun': any(r['overrun'] for r in open_rows),
+            'rate': rate,
+            'rate_src': rate_src,           # observed / batch / constant
+            # 跨批次历史：只显示、不参与计算 —— 让「本批 2.1x」有个参照，
+            # 换机器 / 换模型版本 / GPU 被占用这类变化由人判断（同 Airflow 的 Task Duration）
+            'rate_history': load_rtf_history(d, run.get('engine')),
+            'updated': data_ts or now,      # 数据时刻：最后一条事件的时刻
+            'stale_sec': round(stale_sec, 1),
+            # 阈值随状态下发：前端不再各写一份，改一处即生效；取值随阶段变化
+            'stale_warn': stale_warn,
+            'stale_bad': stale_bad,
+            'stale_cap': STALE_CAP_SEC,
+            'stale_stage': cur_stage,       # 上面两个阈值取自哪个阶段，便于排查
+            'elapsed': round(eff_now - (run.get('created') or eff_now), 1),
         },
         'groups': groups,
         'tasks': rows,
@@ -450,7 +746,9 @@ def compact(d=None, safe_age=COMPACT_SAFE_AGE, dry=False):
     if not dry:
         cp.write_text(json.dumps(sorted(consumed), ensure_ascii=False), encoding='utf-8')
 
-    return {'snapshot_events': len(events), 'retired': retired, 'kept': kept}
+    hist = trim_rtf_history(d, dry=dry)
+    return {'snapshot_events': len(events), 'retired': retired, 'kept': kept,
+            'rtf_history': hist}
 
 
 # --------------------------------------------------------------------------- #
@@ -740,18 +1038,24 @@ def _demo(d, n=6):
         tasks.append({'id': 'BV%d' % (1000000000 + i * 137), 'title': names[i % len(names)],
                       'up': '示例UP主（演示数据）', 'duration_sec': 1300 + i * 90, 'engine': 'funasr-nano'})
     init_run(tasks, title='演示：批次一 · 全 Nano 转写', d=d)
-    emit(task=None, stage='notes', note='看板演示模式启动', d=d)
     for i, t in enumerate(tasks):
         if i < 2:
-            emit(task=t['id'], stage='done', pct=100.0, elapsed=round(t['duration_sec'] / 5.08, 1),
-                 note='已完成 %s' % t['title'][:18], d=d)
+            # 刻意不带 duration_sec：跨批次观察倍率取自这个字段，
+            # 带上就会把演示用的 5.08 记进实盘的历史文件（两者共用上一级目录）
+            emit(task=t['id'], stage='transcribed', pct=100.0, kind='end',
+                 elapsed=round(t['duration_sec'] / 5.08, 1),
+                 note='转写完成 %s' % t['title'][:18], d=d)
         elif i == 2:
             emit(task=t['id'], stage='asr', pct=63.4, started=time.time() - 180, d=d)
             emit(task=t['id'], stage='asr', pct=63.4, note='转写中 63%', d=d)
         elif i == 3:
-            emit(task=t['id'], stage='download', pct=12.0, note='下载音频中', d=d)
+            emit(task=t['id'], stage='download', note='下载音频中', d=d)
         elif i == 4:
-            emit(task=t['id'], stage='fail', pct=40.0, note='音频下载失败: HTTP 503', d=d)
+            emit(task=t['id'], stage='notes', started=time.time() - 95,
+                 note='生成纪要中', d=d)
+        elif i == 5:
+            emit(task=t['id'], stage='done', pct=100.0, elapsed=305.4,
+                 note='已完成（含纪要）', d=d)
     print('已生成演示数据 ->', d)
 
 
@@ -775,6 +1079,12 @@ def main():
     ap.add_argument('--task')
     ap.add_argument('--stage')
     ap.add_argument('--pct', type=float)
+    ap.add_argument('--elapsed', type=float,
+                    help='本阶段已用秒数（生成纪要这类阶段必传，否则看板没有依据）')
+    ap.add_argument('--kind', choices=list(KINDS),
+                    help='事件角色（可选）：begin 阶段开始 / report 进行中 / end 阶段结束')
+    ap.add_argument('--duration-sec', type=float, dest='duration_sec',
+                    help='音频时长（秒），用于推算预计剩余')
     ap.add_argument('--note')
     ap.add_argument('--progress-mode', default=None,
                     help='auto（默认，自动拉起）/ manual（只在已开时上报）/ off（关闭）')
@@ -805,6 +1115,8 @@ def main():
         print('  退役 %d 个: %s' % (len(r['retired']), ', '.join(r['retired']) or '无'))
         for name, why in r['kept']:
             print('  保留 %s（%s）' % (name, why))
+        h = r.get('rtf_history') or {}
+        print('  跨批次历史 %s -> %s 条' % (h.get('before', 0), h.get('after', 0)))
         return
     if a.init:
         if not a.tasks:
@@ -823,8 +1135,9 @@ def main():
         print(url or '未能启动看板（mode=%s）' % progress_mode(a.progress_mode))
         return
     if a.emit:
-        ok = emit(task=a.task, stage=a.stage, pct=a.pct, note=a.note,
-                  group=a.group, d=a.dir)
+        ok = emit(task=a.task, stage=a.stage, pct=a.pct, elapsed=a.elapsed,
+                  duration_sec=a.duration_sec, note=a.note, group=a.group,
+                  kind=a.kind, d=a.dir)
         return print('emit', 'ok' if ok else 'failed')
     if a.serve:
         return serve(a.dir, a.port, a.host, a.open_window)

@@ -1,7 +1,7 @@
 ---
 name: bilibili-video-summary
 description: 用户发送 B站（bilibili）视频链接、BV号、av号或 b23.tv 短链，要求总结视频观点/要点/内容，或要求把视频内容整理成知识库条目时使用。三条路由自动选择：优先字幕直取（秒级，需登录态），无字幕或字幕不可信时走本地 ASR（whisper / Fun-ASR-Nano 双引擎，GPU 加速），再基于全文生成 14 节知识库条目（含 YAML 元数据、检索入口表、实体表、时间线、待验证清单、术语表）。本版本为「便携版」——不依赖 WorkBuddy 与 IMA，纯标准 Python/Node 脚本 + Markdown 指令，可直接装到 Claude / Cursor / ChatGPT 自定义 GPT 等任意支持自定义指令的 AI 平台。触发词：B站、bilibili、BV号、b23.tv、这个视频讲了什么、总结视频、视频要点、存知识库、知识库条目、B站归档。
-version: 2.6.9-portable
+version: 2.7.0-portable
 agent_created: true
 ---
 
@@ -181,7 +181,7 @@ python -m venv "$HOME/.cache/bilibili-video-summary/venvs/asr_eval"
 1. 生成纪要**之前**先查表，命中即按正确写法写入正文
 2. 正确写法进 `entities`/`tags`；**错误写法一律不得进 entities**
 3. 「语境限定」写 `ALL` 的无条件替换；写具体语境的只在命中时替换（历史内容里的"尧舜禹"是本义，不能动）
-4. 写完跑 `python scripts/check_glossary.py <纪要文件>` 兜底复核
+4. 写完跑 `python scripts/check_glossary.py <纪要文件>` 兜底复核（加 `--fix` 只替换 ALL 条目；需判语境的条目要点名 `--force <错误写法>`，全部替换用 `--force-all`；改写前自动留 `.bak`）
 
 > ⚠️ **扫素材包的坑**（2026-09-16 实测）：脚本的 `SKIP_PARTS` 含 `.workbuddy`，2026-09-16 之前的版本在你显式传 `.workbuddy/` 下的目录时**会静默跳过整个目录**、报「未发现命中」——把假阴性误读成"没有错"。**2026-09-16 起已修**：显式指定的扫描根不再被静默过滤，并会在 stderr 提醒；旧版本改用 `--file <单个素材包>` 逐个扫。
 
@@ -375,13 +375,24 @@ BILI_PROGRESS=off python bili_asr.py ...        # 单次关闭
 | 生成纪要 | 我（主 agent） | 命令行 `--emit` |
 | 其它脚本 | 任意进程 | `import progress_hub; progress_hub.auto(task=..., stage=..., pct=...)` |
 
+**主 agent 的两个上报点（缺一不可）**：转写脚本只报到 `transcribed`（待生成纪要），
+「已完成」由我发出。少发一个，任务会一直挂在「待生成纪要」上或反过来提前宣布完成。
+`--kind` 是可选的事件角色（`begin` / `report` / `end`），只为让事件流好回看，**不影响状态判定**。
+
+```bash
+# 开始生成纪要时（把这一阶段的时间起算点划出来）
+python scripts/progress_hub.py --emit --task <BV号> --stage notes --kind begin --note '生成纪要中'
+# 纪要写完、归档完成后
+python scripts/progress_hub.py --emit --task <BV号> --stage done --kind end --elapsed <本轮总秒数> --note '已完成'
+```
+
 **由 `BILI_PROGRESS_DIR` 指定运行目录**——未设置时按项目自动推导（见上）；`BILI_PROGRESS=off` 时上报代码是空操作，零开销、零行为变化：
 
 ```bash
 BILI_PROGRESS_DIR="<run_dir>" python scripts/bili_asr.py --batch-file ... --engine funasr-nano
 ```
 
-> **百分比与时间显示都是估算，不是精确进度**：单条按「已用时间 ÷ (音频时长 ÷ 实测倍率)」插值（上限截到 97%），总进度按各任务预测耗时加权；时间用「服务端基准 + 本地时钟 250ms 平滑推进」，数据停更超 5s 冻结在最后值。算法、三条约束与回归测试说明见 `references/progress-hub-design.md`。
+> **百分比与时间显示都是估算，不是精确进度**：单条按「已用时间 ÷ (音频时长 ÷ 倍率)」插值（上限截到 97%），倍率按「本批实测 → 批量兜底 2.1x → 单条常量」三档取、实测值对样本做指数平滑（近期样本权重更高），顶部会标出用的是哪一档并并排显示历史中位（**历史只显示、不参与计算**）；总进度按各任务预测耗时加权、分母排除失败行。时间用「服务端基准 + 本地时钟 500ms 平滑推进」，外推上限与两档着色阈值都由服务端**按当前阶段**下发（`stale_stage` 标出取自哪个阶段：转写 10/30 秒、生成纪要 300/900 秒，后者天然静默几分钟，不会被误报过期）；数据龄以**最后一条事件**为准（服务端报 `stale_sec`），停更即转黄、转红，转写中还会显示实测速率。下载 / 转码 / 生成纪要三个阶段没有实测样本，不给预计剩余。算法、四条约束与回归测试说明见 `references/progress-hub-design.md`。
 
 ### 设计约束
 
@@ -389,7 +400,7 @@ BILI_PROGRESS_DIR="<run_dir>" python scripts/bili_asr.py --batch-file ... --engi
 - 看板服务只读运行目录，**不写任何管线产物**，可随时启停，不影响正在跑的任务
 - 端口冲突时自动向后找可用端口（并打印**实际**监听地址）；默认只绑 `127.0.0.1`，绑到其它地址会打印无鉴权警告
 - 事件文件按进程累积，跑多批后用 `--compact` 折叠并退役旧文件（`--safe-age` 可调，`--dry-run` 只预演）
-- **已知未修**：管线进程崩溃后，看板仍会按外推继续计 elapsed，直到 `STALE_CAP`（5s）冻结
+- **崩溃后的表现**：外推被 `STALE_CAP`（5s）截住后数字停住，「最后更新」随即转黄、转红；进程没了就没人上报 `fail`，状态只能靠着色提示
 
 ## 广告过滤
 
