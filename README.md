@@ -52,7 +52,8 @@
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
-| **[v2.7.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.0)** | 2026-09-27 | 看板的数字都有依据（预计剩余三档倍率）· 阶段模型补齐（转写完成≠任务完成）· 队列与台账的静默失败修复 |
+| **[v2.7.1](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.1)** | 2026-09-28 | 自测在非 UTC+8 的机器上不再误报失败 · 补上 CI（2 构建 × Windows/Linux） |
+| [v2.7.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.0) | 2026-09-27 | 看板的数字都有依据（预计剩余三档倍率）· 阶段模型补齐（转写完成≠任务完成）· 队列与台账的静默失败修复 |
 | [v2.6.9](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.9) | 2026-09-24 | 校验输出改走文件 · 子代理中间文件位置约束 · 派发后主线程不空等 · 维护与记账规则 |
 | [v2.6.8](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.8) | 2026-09-19 | 修复 `--prompt` 泄漏成正文 · 便携版补齐实测坑 · AI 字幕口径全仓订正 |
 | [v2.6.7](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.7) | 2026-09-19 | 进度看板上报默认开启 · AI 字幕定性订正 · 多语种与批量排期实测回流 |
@@ -63,7 +64,14 @@
 | [v2.2.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.2.0) | 2026-09-05 | 结构校验 · Cookie 自动导出 · 队列按 UP主 过滤 · 合规加固 |
 | [v2.1.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.1.0) | 2026-08-30 | 首次发布：WorkBuddy 原版 + 跨平台便携版 |
 
-### v2.7.0 — 2026-09-27　[Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.0)
+### v2.7.1 — 2026-09-28　[Release Notes](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.1)
+
+- **修掉一处会误伤用户的自测缺陷**：`tests/test_core.py` 里那组「素材包格式」用例拿素材包全文的 sha256 当基线，而正文里的「发布」时间按**本机时区**渲染 —— 基线是在 UTC+8 的机器上算的，于是任何不在 UTC+8 的环境跑自测都会看到「失败 5 项」。而技能文档正是让用户装完跑这条命令验证环境，等于让一部分用户以为自己装坏了。现在把渲染时钟固定在 UTC，格式仍走同一条代码路径，5 个基线按固定后的文本重算
+- **补上仓库自动化**：新增 GitHub Actions 工作流，2 个构建 × Windows / Linux 共四条线，Python 自测与看板前端回归都跑（两条测试的第三方依赖全是延迟导入，CI 不用装 `requirements.txt`）；README 顶部加构建状态徽章
+- **本版只动测试与自动化，运行时行为与 v2.7.0 完全一致** —— 转写、看板、队列的用法都没有变化
+
+<details>
+<summary><b>v2.7.0 — 2026-09-27</b>　看板的数字都有依据 · 阶段模型补齐 · 队列与台账静默失败修复（点击展开）</summary>
 
 - **看板给出的每个数字都要有依据**：预计剩余改按三档倍率估算（本批实测 → 批量兜底 2.1x → 单条常量），顶部标出用的是哪一档；下载 / 转码 / 生成纪要三个阶段没有各自的实测样本，**不再给数字**（显示「—」）；已超预测时显示「已超预估」。批量转写跑到一半就顶到 97%、剩余被压成 0s 的情况没有了
 - **转写完成不再等于任务完成**：新增「待生成纪要」阶段，「已完成」改由写完纪要的一方发出。此前转写脚本直接发「已完成」且终态不可回退，看板在还要生成纪要时就显示「已完成 / 预计剩余 0s」。⚠️ 使用有一处变化：需按 `SKILL.md` 在两个时点上报（开始生成纪要发 `notes`、写完发 `done`），不发则任务停在「待生成纪要」
@@ -71,6 +79,8 @@
 - **队列与台账的静默失败**：台账接口的判据只看输出是否为空，而插件把错误信息写进输出、退出码仍是 0 —— 查询失败会被读成「台账为空」、回写失败会被读成「已处理」；临时文件用固定名，同机并发的两批互相覆盖、素材包与视频错配；术语表 `--fix` 会连需判语境的条目一起替换，现改为默认只换无歧义条目、其余要点名，改写前留备份
 - **不会再默默漏数据**：台账改按游标取全（此前只取前 200 行）；下载补上超时与重试（此前是全项目唯一没有超时的子进程调用）；接口对 412 / 429 / 5xx 退避重试；索引、CSV 台账、Cookie 与素材包改原子写入；编码异常会报出文件名与位置。其余：`av` 号链接不再产出 `bili_None.md`、两条队列新增 `--retry-failed`、whisper 恢复温度回退阶梯、结构校验支持块状列表写法
 - 回归测试：`test_dashboard_times.js` 17 → **49 项**，`tests/test_core.py` 新增一组 18 条断言，端到端验证 **70 项**全通过；三处副本同步
+
+</details>
 
 <details>
 <summary><b>v2.6.9 — 2026-09-24</b>　校验输出改走文件 · 子代理中间文件位置约束 · 派发后主线程不空等 · 维护与记账规则（点击展开）</summary>
