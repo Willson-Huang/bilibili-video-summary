@@ -3,6 +3,7 @@
 # bilibili-video-summary
 
 [![Release](https://img.shields.io/github/v/release/Willson-Huang/bilibili-video-summary?display_name=tag&logo=github)](https://github.com/Willson-Huang/bilibili-video-summary/releases/latest)
+[![tests](https://github.com/Willson-Huang/bilibili-video-summary/actions/workflows/test.yml/badge.svg)](https://github.com/Willson-Huang/bilibili-video-summary/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![Stars](https://img.shields.io/github/stars/Willson-Huang/bilibili-video-summary?style=social)](https://github.com/Willson-Huang/bilibili-video-summary/stargazers)
