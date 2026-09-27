@@ -13,7 +13,7 @@
 
 **EN** — Turn a Bilibili video into a knowledge note you can still search six months later: official subtitles in seconds, or local dual-engine ASR (whisper ≈20× faster, Fun-ASR-Nano far better on Chinese proper nouns), then proper-noun correction + ad filtering, and finally a fixed 14-section Markdown entry that must pass structure and pack validation.
 
-[Releases](https://github.com/Willson-Huang/bilibili-video-summary/releases/latest) · [避坑经验](#避坑经验先看这个能省你几天) · [更新日志](#更新日志最新在上) · [真实输出示例](examples/2025-07-25_哲学知识分享——熵增与熵减_荣格不吃炸鸡_纪要.md) · [快速开始](#快速开始三选一) · [FAQ](#faq)
+[Releases](https://github.com/Willson-Huang/bilibili-video-summary/releases/latest) · [避坑经验](#避坑经验先看这个能省你几天) · [更新日志](#更新日志最新在上) · [为什么做这个](#为什么做这个) · [它是怎么工作的](#它是怎么工作的) · [进度看板](#进度看板mission-control) · [快速开始](#快速开始三选一) · [输出长什么样](#输出长什么样) · [真实输出示例](examples/2025-07-25_哲学知识分享——熵增与熵减_荣格不吃炸鸡_纪要.md) · [FAQ](#faq) · [隐私与数据流向](#隐私与数据流向) · [两个版本](#两个版本) · [升级与清理](#升级与清理) · [目录结构](#目录结构) · [注意事项](#注意事项)
 
 </div>
 
@@ -231,6 +231,15 @@ graph LR
     J --> K["校验 结构 verify_structure / 素材包 verify_pack"]
 ```
 
+**先约定几个词**：
+
+| 叫法 | 指什么 |
+|---|---|
+| **素材包** | 带时间戳的转写全文（含元信息、章节、简介、字幕、热评），归档在本地 `cache/bili_subs/`。它同时是误识修正的唯一依据，所以不随收尾删除 |
+| **字幕来源分级** | `zh-CN` 人工 CC（可信，可作核对基准）与 `ai-zh` B站 AI 生成（原声中文 ASR 轨：正文可用、专名不可信） |
+| **14 节条目** | 最终交付的知识笔记：固定 14 个章节，含实体三张子表、要点表格、时间线、术语表、信息完整性 |
+| **引擎路由** | 无字幕时用哪套 ASR 的判定顺序：UP主白名单 → 视频 tag → 关键词打分（`--classify` 可先看建议） |
+
 **三条路径的差别**：
 
 | 环节 | 说明 |
@@ -262,9 +271,28 @@ python scripts/progress_hub.py --demo --dir <运行目录> && python scripts/pro
 | **阶段与预计剩余** | 阶段按 `排队 → 下载 → 转码 → 转写 → 待生成纪要 → 生成纪要 → 已完成` 依次推进；预计剩余只按有实测依据的阶段给（倍率取「本批实测 → 批量兜底 2.1x → 单条常量」三档，顶部标出来源），没有样本的阶段显示「—」；数据龄按**最后一条事件**算，停更即转黄、转红 |
 | **独立窗口** | Windows 上叠加 `CREATE_BREAKAWAY_FROM_JOB` 逃出宿主 Job Object，流水线结束后看板仍存活 |
 
-> ⚠️ 转写结束不再自动标记「已完成」：要让看板显示完整链路，需按 `SKILL.md` 在两个时点上报 —— 开始生成纪要发 `notes`，纪要写完发 `done`；不发则任务停在「待生成纪要」。
+> ⚠️ 转写结束不再自动标记「已完成」：要让看板显示完整链路，需按所属版本的 SKILL.md（[便携版](./portable/SKILL.md) / [WorkBuddy 版](./workbuddy/SKILL.md)）在两个时点上报 —— 开始生成纪要发 `notes`，纪要写完发 `done`；不发则任务停在「待生成纪要」。
 
 > 上图为 `--demo` 生成的中性演示数据（非真实视频）。
+
+## 前置条件
+
+| 项 | 要求 | 说明 |
+|---|---|---|
+| Python | 3.10+ | 转写与队列脚本；依赖 `pip install -r portable/requirements.txt` |
+| Node | 18+（可选） | 只有想用 `scripts/bili.mjs` 这条「不装 Python」的入口时才需要，主流程用不到 |
+| 显卡 | 可选 | 有 N 卡装 `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` 启用 CUDA；不装自动回退 CPU |
+| 磁盘 | 约 2 GB 起 | 首次运行会下载 whisper 模型（约 1.5 GB，一次性）；音频临时文件另有占用 |
+| 系统 | Windows / macOS / Linux | `.bat` 面向 Windows，`.sh` 面向 Linux / macOS（Git Bash 下未实测） |
+
+**首次运行会发生什么**：从 HuggingFace 拉取模型。当前**默认走镜像站**（`--hf-mirror`，可用 `--no-hf-mirror` 改回官方源）。如果依赖装上了却拉不到模型，按 [`portable/SKILL.md`](./portable/SKILL.md) 的环境变量表设置 `HF_ENDPOINT` / `HF_HUB_DISABLE_SYMLINKS` / `HF_HUB_DISABLE_XET`，并**清空 `PYTHONPATH`**（部分 AI 平台会注入 shim 拦截文件删除，导致装包与模型下载失败）。
+
+装完先跑自测确认环境（不联网、不需要模型）：
+
+```bash
+python portable/tests/test_core.py        # 纯 Python 自测
+node portable/tests/test_dashboard_times.js   # 看板前端回归（需要 Node）
+```
 
 ## 快速开始（三选一）
 
@@ -273,9 +301,9 @@ python scripts/progress_hub.py --demo --dir <运行目录> && python scripts/pro
 
 1. 下载并解压 [便携版 zip](https://github.com/Willson-Huang/bilibili-video-summary/releases/latest)（或 `git clone` 本仓库）
 2. 安装依赖：`pip install -r portable/requirements.txt`
-3. 把 `portable/SKILL.md` **全文**作为指令导入：Claude Projects / Cursor Rules / GPTs Instructions
+3. 把 [`portable/SKILL.md`](./portable/SKILL.md) **全文**作为指令导入：Claude Projects / Cursor Rules / GPTs Instructions
 4. 之后对 AI 说：「总结这个视频 https://www.bilibili.com/video/BVxxxx」即可
-5. 想用中文专名更强的 **Fun-ASR-Nano**（可选）：见 `portable/SKILL.md` 的「第二引擎」安装说明。它跑在**独立的 venv** 里（`funasr` 与 `faster-whisper` 依赖冲突，**不能装进同一个环境**）
+5. 想用中文专名更强的 **Fun-ASR-Nano**（可选）：见 [`portable/SKILL.md`](./portable/SKILL.md) 的「第二引擎」安装说明。它跑在**独立的 venv** 里（`funasr` 与 `faster-whisper` 依赖冲突，**不能装进同一个环境**）
 
 </details>
 
@@ -286,7 +314,7 @@ python scripts/progress_hub.py --demo --dir <运行目录> && python scripts/pro
 2. 解压，把 `bilibili-video-summary/` **整个文件夹**放进 `~/.workbuddy/skills/`
 3. 重启 WorkBuddy，直接发 B站链接
 4. 首次使用前装转写环境：`pip install faster-whisper yt-dlp imageio-ffmpeg`（详见 Release Notes）
-5. 想用中文专名更强的 **Fun-ASR-Nano**（可选）：按 `workbuddy/SKILL.md` 的安装说明，在**独立 venv** 里装（`pip install --no-deps funasr` + 手动装 numpy 2.x），再用 `BILI_PYTHON_NANO` 指向它
+5. 想用中文专名更强的 **Fun-ASR-Nano**（可选）：按 [`workbuddy/SKILL.md`](./workbuddy/SKILL.md) 的安装说明，在**独立 venv** 里装（`pip install --no-deps funasr` + 手动装 numpy 2.x），再用 `BILI_PYTHON_NANO` 指向它
 
 </details>
 
@@ -304,6 +332,28 @@ python scripts/bili_asr.py "https://www.bilibili.com/video/BVxxxx" --out 素材�
 # 自测环境（不联网、不需要模型）
 python tests/test_core.py
 ```
+
+</details>
+
+<details>
+<summary><b>常用参数速查</b></summary>
+
+| 脚本 | 参数 | 用途 |
+|---|---|---|
+| `bili_asr.py` | `--engine whisper\|funasr-nano` | 选引擎；专名密集（历史 / 地理 / 政经）建议 `funasr-nano` |
+| | `--force-asr` | 跳过 B站字幕直取，强制本地转写 |
+| | `--only-meta` · `--classify` | 只抓元信息 · 按「UP主白名单 → tag → 关键词」给出引擎建议 |
+| | `--model` · `--device` · `--compute` · `--lang` | 模型（默认 `large-v3-turbo`）· 设备（默认 `auto`）· 精度（默认 `int8_float16`）· 语种（默认 `zh`） |
+| | `--hotwords <文件>` | 热词表，仅 `funasr-nano` 生效 |
+| | `--keep-audio` · `--no-comments` · `--p N` | 保留音轨 · 不抓热评 · 指定分 P |
+| | `--batch-file` | 批量清单，整批只加载一次模型 |
+| | `--hf-mirror` · `--no-hf-mirror` | 模型下载走镜像（**默认开**）· 改回官方源 |
+| `process_queue.py` | `--init` · `--status` · `--limit N` · `--bvid BV号` | CSV 队列：初始化 · 看状态 · 限量 · 只处理指定条目 |
+| | `--retry-failed` · `--meta-only` | 重跑失败行 · 只补元信息 |
+| `progress_hub.py` | `--serve` · `--demo` · `--emit` | 起看板 · 生成演示数据 · 上报一条事件 |
+| | `--compact` · `--reset` | 裁剪跨批次历史 · 清空运行目录 |
+
+完整参数与更多用法见 [`portable/SKILL.md`](./portable/SKILL.md)。
 
 </details>
 
@@ -351,14 +401,14 @@ python tests/test_core.py
 
 ## FAQ
 
-<details>
+<details open>
 <summary>需要 B站账号 / Cookie 吗？</summary>
 
 不需要。不配 Cookie 也能下载音轨并转写；配置 Cookie（`SESSDATA`）后可解锁 CC/AI 字幕直取（秒级，不用转写）。
 
 </details>
 
-<details>
+<details open>
 <summary>视频有 B站 AI 字幕，是不是就不用本地转写了？</summary>
 
 看字幕来源，不看有没有字幕。
@@ -436,17 +486,30 @@ AI 平台看不到视频内容，只能基于标题、简介、评论猜。本�
 
 | 目录 | 适用场景 | 依赖 |
 |---|---|---|
-| [`workbuddy/`](./workbuddy) | 在 **WorkBuddy** 里使用，保留「资料库在线表」队列 + IMA 知识库归档 | WorkBuddy 运行时、IMA MCP |
-| [`portable/`](./portable) | 装到 **Claude / Cursor / ChatGPT 自定义 GPT** 等任意 AI 平台 | 仅标准 Python/Node + `faster-whisper`/`yt-dlp`/`imageio-ffmpeg` |
+| [`workbuddy/`](./workbuddy) | 在 **WorkBuddy** 里使用，另含「资料库在线表」队列与 IMA 知识库归档 | WorkBuddy 运行时；IMA MCP 只在使用归档功能时需要（可选） |
+| [`portable/`](./portable) | 装到 **Claude / Cursor / ChatGPT 自定义 GPT** 等任意 AI 平台 | Python 3.10+ 与 `faster-whisper` / `yt-dlp` / `imageio-ffmpeg`；Node 18+ 可选（`bili.mjs` 入口） |
+
+## 升级与清理
+
+- **升级**：下载新版 zip 覆盖原目录即可；`workbuddy/` 的装法是整个文件夹替换 `~/.workbuddy/skills/bilibili-video-summary/`。导入到 AI 平台的 `SKILL.md` 需要**重新导入一次**（平台不会自动更新指令）。跨多个版本升级时先看 [Releases](https://github.com/Willson-Huang/bilibili-video-summary/releases) 里的升级提示。
+- **清理**：模型（约 1.5 GB）、音频临时文件与素材包归档都不在发布包里，升级时不受影响。它们的位置由 `BILI_MODEL_DIR` / `BILI_TMP` / `BILI_CACHE` 决定（默认在用户主目录下，见各版本 `SKILL.md` 的环境变量表），直接删目录即可，下次运行会重新下载模型。看板的运行目录用 `--reset` 清空事件与快照、`--compact` 裁剪跨批次历史。
+- **卸载**：删掉安装目录与上述缓存目录；已经写进知识库的笔记、以及 CSV 队列文件不受影响。
 
 ## 目录结构
 
 ```
 bilibili-video-summary/
+├── .github/             # CI（两条测试 × 两个构建 × 两个平台）+ Issue 模板
 ├── docs/                # 文档配图 + 避坑经验完整版 + 实测报告
 ├── examples/            # 真实产出示例（本工具自己生成的 14 节纪要）
-├── workbuddy/           # WorkBuddy 原版（另含在线表队列 library_queue.py、
-│                        #   IMA 上传 ima_cos_upload.py、错误基线体检 baseline_errors.py）
+├── workbuddy/           # WorkBuddy 原版
+│   ├── SKILL.md         # 完整指令（含资料库队列与 IMA 归档的用法）
+│   ├── scripts/         # 与便携版同名的脚本，另含三个专有脚本：
+│   │                    #   library_queue.py   资料库在线表队列
+│   │                    #   ima_cos_upload.py  IMA 知识库上传
+│   │                    #   baseline_errors.py 错字基线体检（只读）
+│   ├── references/      # 与便携版同名（引擎白名单等按本机情况回填）
+│   └── tests/           # 与便携版同名
 └── portable/            # 便携版（无平台依赖）
     ├── SKILL.md         # 完整指令——导入 AI 平台的就是它
     ├── requirements.txt
