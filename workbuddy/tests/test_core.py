@@ -302,15 +302,18 @@ def test_pack_sections():
 
 PACK_GOLDEN = {
     # 2026-09-16 M1：素材包新增「## 元信息」块，五个基线同步更新（每场景仅 +11 行，零删除）
-    'S1_subtitle': '5ef817e06c607312fbe85f03dd610501a033fe56fff41118738233cd682bdefe',
-    'S2_whisper_anon': '6344533872c5683244f5ac78e3ddaeadc6d589a0eb23686bfb3f88bae61a0650',
-    'S3_only_meta': '3cf4be8fb30b6df769b2da586670c1313f3659649da54cf24470dc538197c6bb',
-    'S4_force_asr_multipage': 'c4053695935a34dea15c76a8f3bd8d03456fd8acb63fb1073eeec288df0960b4',
-    'S5_nano_preset': '3051a5d0d057bf4d240bea8bad9dc456d3219367be66dae97e09446b1675a073',
+    # 2026-09-28：正文里的「发布」时间由 fmt_date 渲染，而它走 time.localtime ——
+    #   基线原是在 UTC+8 的机器上算的，换到 UTC 的 CI runner 上 5 个场景全红。
+    #   现在测试把渲染时钟钉在 UTC（见下方 fmt_date 桩），基线按钉住后的文本重算。
+    'S1_subtitle': 'f5a906fefd167556998d619fff18d40de18638b988022152348ab6bfa535db0a',
+    'S2_whisper_anon': '3ea7f1e456b2a63ddec7c32d48a58388e2d46cbf3ab54bbf8c79c12233c64113',
+    'S3_only_meta': '64a084a1c50214cbf8ef186ba871c8a8311a67de32b04fe257b615b020572ab6',
+    'S4_force_asr_multipage': '643fd293b0316af05134bf632fdab70aa587c39ba6db7db8b9305636dcd6802b',
+    'S5_nano_preset': '817464e0c67017b6fc71e1446fa159510f4f0c8028fa6ccb17cf41e73a132ff4',
 }
 _STUBBED = ('resolve_input', 'fetch_meta', 'fetch_player', 'fetch_subtitle_text',
             'fetch_comments', 'load_ad_keywords', 'load_ad_excludes', 'transcribe_with',
-            'ModelHolder', 'download_audio', '_prog')
+            'ModelHolder', 'download_audio', '_prog', 'fmt_date')
 
 
 def _pack_scenarios():
@@ -365,6 +368,9 @@ def test_pack_pipeline():
         audio = tmp / '_audio.m4a'
         audio.write_bytes(b'x')
         bili_asr._prog = lambda: None
+        # 「发布」时间由 fmt_date 渲染，取的是本机时区 —— 拿全文哈希当基线就必须先把时钟钉住，
+        # 否则换一台机器（或 UTC 的 CI）跑，5 个场景会一起红。格式仍走同一条代码路径，只是取值不再随机器的时区变。
+        bili_asr.fmt_date = lambda u: time.strftime('%Y-%m-%d %H:%M', time.gmtime(u))
         bili_asr.resolve_input = lambda raw: ('https://www.bilibili.com/video/BV1TEST00001', 1,
                                               'BV1TEST00001')
         bili_asr.fetch_player = lambda bvid, cid: ([], [])
