@@ -10,8 +10,10 @@
   python verify_structure.py --dir raw          # 校验整个目录
 
 校验四项:
-  1. frontmatter 存在且含必需字段（title/date/type/source/tags/entities/confidence/review_by）
-  2. tags 6-10 个、entities 8-12 个（模板粒度要求，决定半年后能否搜到）
+  1. frontmatter 存在且含必需字段（title/date/type/source/tags/keywords/entities/
+     confidence/review_by）
+  2. tags 的每一项必须带 src/ topic/ entity/ 前缀（书房 schema 第 4 节：不带前缀的
+     标签一律无效）；entities 8-12 个（模板粒度要求，决定半年后能否搜到）
   3. 14 节标题齐全（一～十四，按序）
   4. 内容要点以表格为主（模板：能用表格就不用散文）
 
@@ -25,8 +27,11 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 CN = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十',
       '十一', '十二', '十三', '十四']
-REQUIRED_FM = ['title', 'date', 'type', 'source', 'tags', 'entities',
+REQUIRED_FM = ['title', 'date', 'type', 'source', 'tags', 'keywords', 'entities',
                'confidence', 'review_by']
+NS = ('src/', 'topic/', 'entity/')
+# 封闭枚举（书房 schema 第 3 节）；本脚本只处理 _纪要.md，故转写类 4 值为常用项
+TYPE_ENUM = {'转写·访谈', '转写·科普', '转写·评论', '转写·教程', '公众号', '政策原文'}
 
 
 def _yaml_list(block, key):
@@ -67,16 +72,30 @@ def check(path: Path):
                 if not re.search(rf'^{k}:\s*\S', block, re.M)]
         if miss:
             errors.append(f'frontmatter 缺字段: {", ".join(miss)}')
+        # type 是封闭枚举：自创值（如旧模板的「播客访谈纪要」）进库即判不合规
+        mt = re.search(r'^type:\s*(\S+)', block, re.M)
+        if mt and mt.group(1) not in TYPE_ENUM:
+            errors.append(f'`type` 不在枚举表内: {mt.group(1)}'
+                          f'（可选值 {" / ".join(sorted(TYPE_ENUM))}）')
         tags_items, tags_style = _yaml_list(block, 'tags')
         ent_items, ent_style = _yaml_list(block, 'entities')
         tags_n, ent_n = len(tags_items), len(ent_items)
-        for key, style, n, lo, hi in (('tags', tags_style, tags_n, 6, 10),
-                                      ('entities', ent_style, ent_n, 8, 12)):
-            if style == 'missing':
-                warnings.append(f'{key} 读不出条目（既不是内联数组也不是块状列表），'
-                                f'本项无法校验')
-            elif not (lo <= n <= hi):
-                warnings.append(f'{key} {n} 个（指引 {lo}-{hi}）')
+        # tags 改查「带命名空间前缀」而不是个数（2026-09-28）：
+        # 本库 tags 已分层——只放可导航的桶名（src/ topic/ entity/），
+        # 原有具体词全量进 keywords。仍按旧规则要求 6-10 个会逼出无前缀标签，
+        # 而这类标签进库会被 check_frontmatter.py 判为不合规。
+        if tags_style == 'missing':
+            warnings.append('tags 读不出条目（既不是内联数组也不是块状列表），'
+                            '本项无法校验')
+        else:
+            badns = [x for x in tags_items if not x.startswith(NS)]
+            if badns:
+                warnings.append('tags 含无命名空间前缀项: ' + ', '.join(badns[:5]))
+        if ent_style == 'missing':
+            warnings.append('entities 读不出条目（既不是内联数组也不是块状列表），'
+                            '本项无法校验')
+        elif not (8 <= ent_n <= 12):
+            warnings.append(f'entities {ent_n} 个（指引 8-12）')
 
     # 3. 14 节
     heads = re.findall(r'^##\s*(.+)$', t, re.M)

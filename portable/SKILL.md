@@ -251,7 +251,7 @@ ASR 听错的专名往往仍是「合法中文词」，快速通读不会起疑�
 
 | 节 | 内容 |
 |---|---|
-| frontmatter | 元数据 + **tags** + **entities** + confidence + review_by |
+| frontmatter | 元数据 + **tags** + **keywords** + **entities** + confidence + review_by |
 | 一 | 检索入口表：这条知识能回答什么问题 |
 | 二 | 核心结论（一句话 + 3–5 条带时间戳要点） |
 | 三 | 关键实体表（人物 / 产品 / 模型或制度） |
@@ -478,7 +478,7 @@ python scripts/verify_structure.py --dir raw     # 全库体检
 
 详细结果写进当前目录的 `verify_structure_out.txt`，终端只打印末 6 行汇总（2026-09-24 起）。**在当批的缓存目录下执行**，日志就不会落在库根；要看逐条明细去读那个文件，不要为了省事把 `--dir` 的完整输出打到终端。
 
-校验四项：frontmatter 齐全、tags 6–10 / entities 8–12、14 节齐全、内容要点已表格化。**任一项不通过就退回重写，不要带着结构缺陷交付。**
+校验四项：frontmatter 齐全（含 `keywords`；`type` 落在封闭枚举内、`tags` 每项带 `src/` `topic/` `entity/` 前缀）、`entities` 8–12、14 节齐全、内容要点已表格化。**任一项不通过就退回重写，不要带着结构缺陷交付。**
 
 与 `verify_coverage.py` 分工：本脚本查「结构对不对」，`verify_coverage.py <原> <新>` 查「增强时有没有遗失」。重写时两个都必须过。
 
