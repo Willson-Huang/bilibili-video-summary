@@ -18,13 +18,15 @@ sys.stderr.reconfigure(encoding='utf-8')
 from bili_wbi import UA, http_json, wbi_url
 HOME = Path.home()
 # 路径全部可用环境变量覆盖，便于迁移到其他机器 / 便携部署
-MODEL_DIR = Path(os.environ.get('BILI_MODEL_DIR',
-                                str(HOME / '.workbuddy' / 'models' / 'whisper')))
-AUDIO_DIR = Path(os.environ.get('BILI_TMP', str(HOME / '.workbuddy' / 'tmp' / 'bili_audio')))
-COOKIE_FILE = Path(os.environ.get('BILI_COOKIE', str(HOME / '.workbuddy' / '.bilibili_cookie')))
+# 便携版的缓存根目录是 BILI_CACHE（默认 ~/.cache/bilibili-video-summary），
+# 与 chrome_cookie_export.py 写出凭据的位置一致；变量表见 SKILL.md
+CACHE = Path(os.environ.get('BILI_CACHE', str(HOME / '.cache' / 'bilibili-video-summary')))
+MODEL_DIR = Path(os.environ.get('BILI_MODEL_DIR', str(CACHE / 'models' / 'whisper')))
+AUDIO_DIR = Path(os.environ.get('BILI_TMP', str(CACHE / 'tmp' / 'bili_audio')))
+COOKIE_FILE = Path(os.environ.get('BILI_COOKIE', str(CACHE / '.bilibili_cookie')))
 # Nano 引擎跑在独立 venv（funasr 与 faster-whisper/CTranslate2 依赖冲突，绝不合并装）
-PY_NANO = Path(os.environ.get('BILI_PYTHON_NANO', str(
-    HOME / '.workbuddy' / 'binaries' / 'python' / 'envs' / 'asr_eval' / 'Scripts' / 'python.exe')))
+NANO_BIN = 'Scripts/python.exe' if os.name == 'nt' else 'bin/python'
+PY_NANO = Path(os.environ.get('BILI_PYTHON_NANO', str(CACHE / 'venvs' / 'asr_eval' / NANO_BIN)))
 NANO_ADAPTER = Path(__file__).resolve().parent / 'funasr_adapter.py'
 UP_WHITELIST = Path(__file__).resolve().parent.parent / 'references' / 'engine_up_whitelist.txt'
 # 分区映射表不随本仓库分发（上游文档因合规原因已关停）；缺失时该信号自动跳过
@@ -231,7 +233,7 @@ def resolve_input(raw):
 
 
 # ---------------- 元信息 ----------------
-META_CACHE_DIR = HOME / '.workbuddy' / 'cache' / 'bili' / 'meta'
+META_CACHE_DIR = CACHE / 'bili' / 'meta'
 META_CACHE_TTL = 86400  # 秒；24h 内复用元信息缓存，避免队列阶段一/阶段二重复抓 view
 
 

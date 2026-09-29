@@ -1,7 +1,7 @@
 ---
 name: bilibili-video-summary
 description: 用户发送 B站（bilibili）视频链接、BV号、av号或 b23.tv 短链，要求总结视频观点/要点/内容，或要求把视频内容整理成知识库条目时使用。三条路由自动选择：优先字幕直取（秒级，需登录态），无字幕或字幕不可信时走本地 ASR（whisper / Fun-ASR-Nano 双引擎，GPU 加速），再基于全文生成 14 节知识库条目（含 YAML 元数据、检索入口表、实体表、时间线、待验证清单、术语表）。本版本为「便携版」——不依赖 WorkBuddy 与 IMA，纯标准 Python/Node 脚本 + Markdown 指令，可直接装到 Claude / Cursor / ChatGPT 自定义 GPT 等任意支持自定义指令的 AI 平台。触发词：B站、bilibili、BV号、b23.tv、这个视频讲了什么、总结视频、视频要点、存知识库、知识库条目、B站归档。
-version: 2.7.1-portable
+version: 2.7.2-portable
 agent_created: true
 ---
 
@@ -56,8 +56,9 @@ bash scripts/bili.sh "<B站链接>"
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `BILI_PYTHON` | `python`（PATH 中） | 运行脚本用的 Python 解释器（装了上述依赖的那个） |
-| `BILI_CACHE` | `~/.cache/bilibili-video-summary` | Whisper 模型、临时音频、Cookie 的缓存根目录 |
-| `BILI_COOKIE` | `$BILI_CACHE/.bilibili_cookie` | B站登录 Cookie 文件路径（会员/付费视频需要） |
+| `BILI_CACHE` | `~/.cache/bilibili-video-summary` | 缓存根目录：模型、临时音频、Cookie、Nano 环境都在它下面 |
+| `BILI_MODEL_DIR` | `$BILI_CACHE/models/whisper` | Whisper 模型缓存目录 |
+| `BILI_COOKIE` | `$BILI_CACHE/.bilibili_cookie` | B站登录 Cookie 文件路径（会员/付费视频需要）。`chrome_cookie_export.py` 写出的就是这个文件 |
 | `BILI_CSV` | `./bilibili_queue.csv` | 本地 CSV 队列路径 |
 | `BILI_TMP` | `$BILI_CACHE/tmp/bili_audio` | 音频临时目录 |
 | `PYTHONPATH` | 空 | 部分 AI 平台会注入 shim 拦截文件删除 → HF 下载/pip 装大包失败，必须清空 |
