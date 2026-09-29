@@ -51,7 +51,8 @@
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
-| **[v2.7.1](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.1)** | 2026-09-28 | 自测在非 UTC+8 的机器上不再误报失败 · 补上 CI（2 构建 × Windows/Linux） |
+| **[v2.7.2](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.2)** | 2026-09-29 | 便携版凭据路径修正（导出的 Cookie 此前读不到）· 条目格式对齐知识库 · 文档精简 280 行 |
+| [v2.7.1](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.1) | 2026-09-28 | 自测在非 UTC+8 的机器上不再误报失败 · 补上 CI（2 构建 × Windows/Linux） |
 | [v2.7.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.0) | 2026-09-27 | 看板的数字都有依据（预计剩余三档倍率）· 阶段模型补齐（转写完成≠任务完成）· 队列与台账的静默失败修复 |
 | [v2.6.9](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.9) | 2026-09-24 | 校验输出改走文件 · 子代理中间文件位置约束 · 派发后主线程不空等 · 维护与记账规则 |
 | [v2.6.8](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.8) | 2026-09-19 | 修复 `--prompt` 泄漏成正文 · 便携版补齐实测坑 · AI 字幕口径全仓订正 |
