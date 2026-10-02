@@ -29,6 +29,8 @@
   7. --finish 收尾：只有素材包归档成功（已在 bili_subs 或成功 move）才置「已完成」；归档失败不动台账
   8. 台账回写攒批提交（每 20 条或结尾 flush）；回写失败项进 report.write_failed 并以非零退出
   9. 输出 JSON，processed[].note_name 给出标准纪要文件名
+ 10. --finish 收尾成功后自动为看板里的同一 BV 补发完成信号（notes_done.py 对账，
+     看板不可用只影响 dashboard 字段，不改变收尾结果）
 
 状态列取值：待处理 / 已转写 / 已完成 / 失败
 （2026-09-16 起重复项**不写台账**——该列实测无「重复」选项；历史数据若残留该值，仍按已处理识别）
@@ -463,10 +465,22 @@ def main():
 
         update(a.token, a.database_id,
                [{'record_id': hits[0]['record_id'], 'properties': props}])
+
+        # 台账已置「已完成」，顺手把看板里的同一个任务补发完成信号。这一步原先靠人工执行
+        # --emit，实测累计漏了 7 次；放在收尾里就与台账同进同退。看板不可用只影响这一项，
+        # 不改变收尾结果，所以整段兜住异常。（notes_done 会回头 import 本模块，多加载一次
+        # 模块对象，代价是一次目录扫描，换取不复制 note_name/parse_pack_header。）
+        try:
+            import notes_done
+            dashboard = notes_done.reconcile(None, str(raw_dir), str(cache_dir), only=[want])
+        except Exception as e:
+            dashboard = {'error': f'{type(e).__name__}: {e}'}
+
         print(json.dumps({'finished': want, 'archived': archived,
                           'index_healed': healed,
                           'pack_check': pack_check,
                           'pack_warnings': vp_warnings,
+                          'dashboard': dashboard,
                           'properties': props}, ensure_ascii=False, indent=2))
         return
 

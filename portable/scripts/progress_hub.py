@@ -46,13 +46,14 @@ DEFAULT_DIR = Path(os.environ.get(
 STAGE_LABEL = {
     'queued': '排队', 'download': '下载音频', 'convert': '转码',
     'asr': '转写中', 'transcribed': '待生成纪要', 'notes': '生成纪要',
+    'pending': '待编译',
     'done': '已完成', 'fail': '失败',
 }
 # 阶段序：只允许向前推进，迟到的旧阶段事件不会把显示拉回去。
 # done 与 fail 同阶。转写脚本只发到 transcribed，「已完成」由写完纪要的一方发出 ——
 # 若让转写脚本直接发 done，终态锁会把后到的 notes 吞掉，看板会提前宣布完成。
 STAGE_RANK = {'queued': 0, 'download': 1, 'convert': 2, 'asr': 3,
-              'transcribed': 4, 'notes': 5, 'done': 8, 'fail': 8}
+              'transcribed': 4, 'notes': 5, 'pending': 6, 'done': 8, 'fail': 8}
 TERMINAL = ('done', 'fail')
 # 进行中阶段：这些阶段的「已用时间」可以从事件时刻外推
 ACTIVE_STAGES = ('download', 'convert', 'asr', 'notes')
@@ -77,7 +78,10 @@ RTF_EMA_ALPHA = 0.3
 # 沿用单一阈值会让它一直被标成过期。
 STAGE_HEARTBEAT = {
     'queued': 30, 'download': 10, 'convert': 10, 'asr': 10,
-    'transcribed': 300, 'notes': 300, 'done': 3600, 'fail': 3600,
+    'transcribed': 300, 'notes': 300,
+    # 待编译由人工决定何时开工，可能搁置数天，心跳按天算才不会一直报陈旧
+    'pending': 86400,
+    'done': 3600, 'fail': 3600,
 }
 # 兜底阈值（秒）：阶段不在上表里时使用，前端也保留同一组兜底值
 STALE_WARN_SEC = 10
@@ -113,6 +117,131 @@ def run_dir(d=None):
     p = Path(d) if d else DEFAULT_DIR
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+# --------------------------------------------------------------------------- #
+# 批次隔离（2026-10-02）
+#
+# 运行目录名固定是 current，所有脚本都往它写、看板也读它 —— 这样两边都不必知道
+# 批次的存在。隔离发生在「开新批」那一步：把 current 整份搬进
+# `batches/<时间>-<来源>/`，再重建一个空的 current。新批次因此看不到旧批次的任务，
+# 历史又按目录原样留了下来。
+# 在此之前，所有批次共用一个 run.json，`created` 被首个写入者锁住 —— 「已耗时」
+# 曾经显示成 415 小时（目录年龄），任务量也越滚越多。
+# --------------------------------------------------------------------------- #
+BATCHES_SUBDIR = 'batches'
+# 轮转时留在原地不搬：这些属于「服务状态」，不算「批次数据」
+ROTATE_KEEP = ('hub.json',)
+_INVALID_NAME_CHARS = None
+
+
+def batches_root(d=None):
+    """批次归档目录（与运行目录同级）。"""
+    return run_dir(d).parent / BATCHES_SUBDIR
+
+
+def batch_name(group=None):
+    """批次目录名：时间戳 + 来源。来源清洗掉文件名非法字符，取不到就只用时间戳。"""
+    global _INVALID_NAME_CHARS
+    if _INVALID_NAME_CHARS is None:
+        import re
+        _INVALID_NAME_CHARS = re.compile(r'[\\/:*?"<>|\r\n\t ]+')
+    name = time.strftime('%Y%m%d-%H%M%S', time.localtime())
+    src = _INVALID_NAME_CHARS.sub('', str(group or '')).strip()
+    return '%s-%s' % (name, src) if src else name
+
+
+def _has_batch_data(d):
+    """目录里有没有值得归档的东西 —— 只看 run.json 与事件，不看 hub.json。"""
+    return (d / 'run.json').is_file() or next(d.glob('events_*.jsonl'), None) is not None
+
+
+def rotate_batch(d=None, group=None):
+    """把当前运行目录整份搬进批次归档，并重建空目录；返回归档路径。
+
+    目录本来就是空的（没有 run.json、也没有事件）时**什么都不做**并返回 None ——
+    否则连续开批会留下一串空目录。
+    """
+    import shutil
+    d = run_dir(d)
+    if not _has_batch_data(d):
+        return None
+    root = batches_root(d)
+    name = batch_name(group)
+    dst = root / name
+    n = 2
+    while dst.exists():                      # 同一秒内连开两批的兜底
+        dst = root / ('%s-%d' % (name, n))
+        n += 1
+    dst.mkdir(parents=True, exist_ok=True)
+    for f in sorted(d.iterdir()):
+        if f.name in ROTATE_KEEP:
+            continue
+        try:
+            shutil.move(str(f), str(dst / f.name))
+        except OSError:
+            pass                             # 被占用（看板正在读）不该让开批失败
+    with _RAW_LOCK:
+        _RAW_CACHE.pop(str(d), None)
+    return dst
+
+
+def list_batches(d=None):
+    """已归档的批次，新的在前。带条目数与完成数，供看板的批次选择器直接用。"""
+    root = batches_root(d)
+    if not root.is_dir():
+        return []
+    out = []
+    for p in sorted((x for x in root.iterdir() if x.is_dir()), reverse=True):
+        info = {'name': p.name, 'title': None, 'created': None, 'total': 0, 'done': 0}
+        rp = p / 'run.json'
+        if rp.is_file():
+            try:
+                doc = json.loads(rp.read_text(encoding='utf-8'))
+                info['title'] = doc.get('title')
+                info['created'] = doc.get('created')
+                info['total'] = len([t for t in (doc.get('tasks') or [])
+                                     if isinstance(t, dict)])
+            except Exception:
+                pass
+        try:
+            info['done'] = snapshot(p)['overall']['done']
+        except Exception:
+            pass
+        out.append(info)
+    return out
+
+
+def resolve_view_dir(name=None, d=None):
+    """把批次名解析成目录；名字不合法就回退到当前批。
+
+    名字只接受 batches/ 下的**直接子目录**（用 parent 比对挡掉 `..` 与带分隔符的写法），
+    避免看板变成任意路径的读取器。
+    """
+    base = run_dir(d)
+    if not name or name in ('current', '.'):
+        return base
+    root = batches_root(base)
+    cand = root / str(name)
+    try:
+        if cand.is_dir() and cand.parent.resolve() == root.resolve():
+            return cand
+    except OSError:
+        pass
+    return base
+
+
+def batch_overview(d=None):
+    """当前批 + 已归档批次，供看板的批次选择器使用。"""
+    base = run_dir(d)
+    snap = snapshot(base)
+    return {
+        'current': {'name': 'current', 'title': snap['run'].get('title'),
+                    'created': snap['run'].get('created'),
+                    'total': snap['overall']['total'],
+                    'done': snap['overall']['done']},
+        'batches': list_batches(base),
+    }
 
 
 _BV_RE = None
@@ -375,14 +504,21 @@ def effective_rtf(d=None, engine='funasr-nano'):
     return RTF.get(engine, DEFAULT_RTF), 'constant'
 
 
-def init_run(tasks, title='任务批次', d=None, meta=None, merge=True, group=None):
+def init_run(tasks, title='任务批次', d=None, meta=None, merge=True, group=None,
+             new_batch=False):
     """写入任务清单。
 
     merge=True（默认）时**并入**已有清单而不是替换 —— 两个 skill（转写 / wiki 编译）
     共用同一个运行目录，谁都不能把对方的任务冲掉。同 id 的任务按新值更新
     （重跑时刷新标题与时长）。
+
+    new_batch=True 时先把当前运行目录整份归档（见 rotate_batch），再写这一批。
+    只该由「开始一次新运行」的一方传 —— 补数据、追加任务的一方不能传，
+    否则会把自己刚写进去的东西一起搬走。
     """
     d = run_dir(d)
+    if new_batch:
+        rotate_batch(d, group=group)
     rp = d / 'run.json'
     doc = {'title': title, 'created': time.time(), 'tasks': []}
     if merge and rp.is_file():
@@ -651,7 +787,10 @@ def snapshot(d=None):
     wsum = sum(weights) or 1.0
     overall = sum(w * (r['pct'] / 100.0) for w, r in zip(weights, progresses)) / wsum * 100
     open_rows = [r for r in rows if r['stage'] not in TERMINAL]
-    remaining = sum((r['pred_sec'] or 0) * (1 - r['pct'] / 100.0) for r in open_rows)
+    # 只累加「有依据」的行（eta 非空 = 转写中 / 还没开始）。
+    # 不能拿 pred_sec 直接累加：待编译这类人工阶段自带预估秒数、百分比又是 0，
+    # 会被当成「还没开始跑」算进去，报出一个根本不存在的完成时刻。
+    remaining = sum(r['eta'] for r in open_rows if r['eta'] is not None)
     log = [{'ts': e['ts'], 'task': e.get('task'), 'stage': e.get('stage'),
             'stage_label': STAGE_LABEL.get(e.get('stage'), e.get('stage')),
             'kind': e.get('kind'),
@@ -696,7 +835,12 @@ def snapshot(d=None):
             'stale_bad': stale_bad,
             'stale_cap': STALE_CAP_SEC,
             'stale_stage': cur_stage,       # 上面两个阈值取自哪个阶段，便于排查
-            'elapsed': round(eff_now - (run.get('created') or eff_now), 1),
+            # 「已耗时」＝各已完成任务的实测耗时合计。原先算的是 eff_now − created，
+            # 而 created 是运行目录的建立时刻（merge 时保留首个写入者），运行目录又不按
+            # 批次隔离 —— 直接相减量到的是「目录存在了多久」（实盘 2026-10-02：415 小时
+            # ＝ 17 天，而任务实际耗时合计只有 3.46 小时）。
+            'elapsed': round(sum(r['elapsed'] for r in rows
+                                 if r['stage'] == 'done' and r.get('elapsed')), 1),
         },
         'groups': groups,
         'tasks': rows,
@@ -775,15 +919,23 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
-        path = self.path.split('?')[0]
+        from urllib.parse import urlsplit, parse_qs
+        parts = urlsplit(self.path)
+        path = parts.path
+        # ?batch=<名字> 切到某个已归档批次；名字非法时 resolve_view_dir 会回退到当前批
+        batch = (parse_qs(parts.query).get('batch') or [None])[0]
         if path in ('/', '/index.html', '/dashboard'):
             f = HERE / 'dashboard.html'
             if not f.is_file():
                 return self._send(500, '{"error":"dashboard.html 缺失"}')
             return self._send(200, f.read_bytes(), 'text/html; charset=utf-8')
         if path == '/api/state':
-            return self._send(200, json.dumps(snapshot(self.server.run_dir),
-                                              ensure_ascii=False))
+            return self._send(200, json.dumps(
+                snapshot(resolve_view_dir(batch, self.server.run_dir)),
+                ensure_ascii=False))
+        if path == '/api/batches':
+            return self._send(200, json.dumps(
+                batch_overview(self.server.run_dir), ensure_ascii=False))
         if path == '/api/health':
             return self._send(200, '{"ok":true}')
         if path == '/favicon.ico':
@@ -1071,6 +1223,9 @@ def main():
                     help='用 Chromium 系浏览器的 --app 模式开独立窗口（无地址栏）')
     ap.add_argument('--demo', action='store_true', help='生成演示数据')
     ap.add_argument('--init', action='store_true', help='用 --tasks 初始化一次运行')
+    ap.add_argument('--new-batch', action='store_true',
+                    help='配合 --init：先把当前运行目录整份归档，再写这一批')
+    ap.add_argument('--list-batches', action='store_true', help='列出已归档的批次')
     ap.add_argument('--tasks', help='任务清单 JSON 文件或 JSON 字符串')
     ap.add_argument('--title', default='任务批次')
     ap.add_argument('--engine', default='funasr-nano')
@@ -1127,8 +1282,17 @@ def main():
         else:
             tasks = json.loads(src)
         d = init_run(tasks, title=a.title, d=a.dir, group=a.group,
-                     meta={'engine': a.engine})
-        print('已并入 %d 个任务 -> %s' % (len(tasks), d))
+                     meta={'engine': a.engine}, new_batch=a.new_batch)
+        print('已%s %d 个任务 -> %s'
+              % ('开新批并写入' if a.new_batch else '并入', len(tasks), d))
+        return
+    if a.list_batches:
+        rows = list_batches(a.dir)
+        if not rows:
+            return print('（还没有归档的批次）')
+        for r in rows:
+            print('  %-30s %s/%s  %s' % (r['name'], r['done'], r['total'],
+                                         r['title'] or ''))
         return
     if a.ensure:
         url = ensure_serving(a.dir, a.host, a.port, a.open_window, a.progress_mode)

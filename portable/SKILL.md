@@ -1,7 +1,7 @@
 ---
 name: bilibili-video-summary
 description: 用户发送 B站（bilibili）视频链接、BV号、av号或 b23.tv 短链，要求总结视频观点/要点/内容，或要求把视频内容整理成知识库条目时使用。三条路由自动选择：优先字幕直取（秒级，需登录态），无字幕或字幕不可信时走本地 ASR（whisper / Fun-ASR-Nano 双引擎，GPU 加速），再基于全文生成 14 节知识库条目（含 YAML 元数据、检索入口表、实体表、时间线、待验证清单、术语表）。本版本为「便携版」——不依赖 WorkBuddy 与 IMA，纯标准 Python/Node 脚本 + Markdown 指令，可直接装到 Claude / Cursor / ChatGPT 自定义 GPT 等任意支持自定义指令的 AI 平台。触发词：B站、bilibili、BV号、b23.tv、这个视频讲了什么、总结视频、视频要点、存知识库、知识库条目、B站归档。
-version: 2.7.2-portable
+version: 2.8.0-portable
 agent_created: true
 ---
 
@@ -332,6 +332,12 @@ Windows 上 `msedge.exe` / `chrome.exe` 通常**不在 PATH**，脚本内置常�
 2. `BILI_PROGRESS=off` → 不启用
 3. 否则从**当前目录**向上找含 `.workbuddy` 的目录 → `<该目录>/.workbuddy/cache/progress/current`
 4. 都找不到 → 不启用（**绝不在任意 cwd 下创建**）
+
+**批次隔离（2026-10-02）**：运行目录名固定是 `current`，但每个批次只写自己那一份 ——
+一次新的转写运行（批量或单条）会把上一批整份搬进 `batches/<时间>-<来源>/`，再重建空的
+`current`。看板看到的始终是「本批」，历史批在顶部的选择器里切回。手工开一批用
+`progress_hub.py --init --new-batch --tasks ...`；列出已归档批次用 `--list-batches`。
+⚠️ **补数据、登记待编译的一方不要传 `new_batch`** —— 那会连自己刚写进去的一起搬走。
 
 > ⚠️ **上报链路 `try/except` 全吞**：运行目录解析失败或上报未启用时，**退出码仍是 0、零日志**，从外部看不出被跳过。要确认在跑，看运行目录下有没有 `events_*.jsonl`。
 

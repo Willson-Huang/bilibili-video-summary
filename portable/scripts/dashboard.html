@@ -9,6 +9,7 @@
     --bg:#060911; --panel:rgba(17,23,39,.72); --line:rgba(120,150,220,.14);
     --txt:#e8eefc; --dim:#8296b8; --cyan:#22d3ee; --violet:#a78bfa;
     --emerald:#34d399; --rose:#fb7185; --amber:#fbbf24; --blue:#60a5fa;
+    --emerald-soft:#6ee7b7; --rose-soft:#fda4af;
     --mono:"JetBrains Mono",ui-monospace,"Cascadia Mono",Consolas,"SF Mono",monospace;
   }
   *{box-sizing:border-box}
@@ -54,6 +55,12 @@
   .dot{width:7px; height:7px; border-radius:50%; background:var(--emerald);
     box-shadow:0 0 0 0 rgba(52,211,153,.7); animation:pulse 1.8s infinite}
   .live.dead{color:var(--rose)} .live.dead .dot{background:var(--rose); animation:none}
+  /* 批次切换器：只在有归档批次时才显示（见 loadBatches） */
+  .batchpick{display:none; margin-top:10px; max-width:340px; font:600 11px/1.6 var(--mono);
+    color:var(--dim); background:rgba(120,150,220,.08); border:1px solid var(--line);
+    border-radius:8px; padding:5px 9px; cursor:pointer; appearance:none}
+  .batchpick.on{display:block}
+  .batchpick:hover,.batchpick:focus{color:var(--txt); border-color:rgba(96,165,250,.42)}
   @keyframes pulse{70%{box-shadow:0 0 0 9px rgba(52,211,153,0)}100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}}
 
   .ring{position:relative; width:148px; height:148px; flex:0 0 auto}
@@ -112,6 +119,7 @@
   .b-asr{color:var(--cyan); border-color:rgba(34,211,238,.4); background:rgba(34,211,238,.1)}
   .b-notes{color:var(--violet); border-color:rgba(167,139,250,.42); background:rgba(167,139,250,.11)}
   .b-transcribed{color:var(--blue); border-color:rgba(96,165,250,.36); background:rgba(96,165,250,.1)}
+  .b-pending{color:var(--amber); border-color:rgba(251,191,36,.4); background:rgba(251,191,36,.1)}
   .b-done{color:var(--emerald); border-color:rgba(52,211,153,.4); background:rgba(52,211,153,.1)}
   .b-fail{color:var(--rose); border-color:rgba(251,113,133,.42); background:rgba(251,113,133,.1)}
   .note{color:var(--dim); font-size:11.5px; margin-top:5px; white-space:nowrap;
@@ -127,8 +135,8 @@
     background:linear-gradient(90deg,transparent,rgba(255,255,255,.45),transparent);
     animation:shim 1.5s linear infinite}
   @keyframes shim{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
-  .row.done .bar>i{background:linear-gradient(90deg,var(--emerald),#6ee7b7)}
-  .row.fail .bar>i{background:linear-gradient(90deg,var(--rose),#fda4af)}
+  .row.done .bar>i{background:linear-gradient(90deg,var(--emerald),var(--emerald-soft))}
+  .row.fail .bar>i{background:linear-gradient(90deg,var(--rose),var(--rose-soft))}
   .row.queued .bar>i::after,.row.done .bar>i::after{animation:none; opacity:0}
 
   .num{text-align:right; min-width:104px}
@@ -165,9 +173,55 @@
   .gchip .gbar>i{display:block; height:100%; width:0; border-radius:99px;
     background:linear-gradient(90deg,var(--cyan),var(--violet));
     transition:width .5s cubic-bezier(.4,0,.2,1)}
+  /* ---------- 分区：执行中 / 已完成 ----------
+     两类任务的关注点不同：进行中的要看趋势，已完成的只需确认结果。
+     同列平铺时，完成项会把正在跑的挤到看不见的地方。 */
+  .zone{margin-bottom:18px}
+  .zhead{display:flex; align-items:center; gap:10px; margin:0 0 9px;
+    font:600 10.5px/1 var(--mono); letter-spacing:.18em; color:var(--dim);
+    text-transform:uppercase}
+  .zhead[hidden]{display:none}
+  .zcount{color:var(--txt); font-weight:700; letter-spacing:.06em}
+  .zline{flex:1; height:1px; background:var(--line)}
+  /* 已完成区整区可折叠（默认展开为摘要行） */
+  button.ztoggle{width:100%; margin:0; padding:0; border:0; background:none;
+    cursor:pointer; text-align:left; color:inherit; font:inherit}
+  button.ztoggle:focus-visible{outline:2px solid var(--emerald); outline-offset:4px}
+  .chev{width:0; height:0; border:4px solid transparent; border-left-color:var(--emerald);
+    transform:rotate(90deg); transform-origin:2px 50%; transition:transform .2s ease}
+  .done-zone.folded .chev{transform:rotate(0)}
+  .done-zone.folded .list-done{display:none}
+  .zhint{letter-spacing:.05em; text-transform:none; color:rgba(130,150,184,.62)}
+  .done-zone{border:1px solid rgba(52,211,153,.18); border-radius:15px;
+    padding:13px 16px 6px; background:rgba(9,15,26,.55)}
+  .done-zone .zname,.done-zone .zcount{color:var(--emerald)}
+  .done-zone .zline{background:rgba(52,211,153,.2)}
+
+  /* 已完成条目：默认只留摘要行（序号 + 标题 + 实际耗时），
+     悬停或键盘聚焦才展开详情；触屏没有悬停，直接展开。 */
+  .list-done{gap:0}
+  .list-done .row{grid-template-columns:30px 1fr auto; gap:12px; padding:9px 4px;
+    border:0; border-bottom:1px solid rgba(120,150,220,.08); border-radius:0;
+    background:transparent; backdrop-filter:none; box-shadow:none;
+    transition:background .16s ease}
+  .list-done .row:last-child{border-bottom:0}
+  .list-done .row:hover{transform:none; border-color:transparent;
+    background:rgba(52,211,153,.055); box-shadow:none}
+  .list-done .row .idx{width:30px; height:30px; border-radius:9px; font-size:12px}
+  .list-done .row .ttl{font-size:13.5px; font-weight:500; color:rgba(232,238,252,.84)}
+  .list-done .row .num{min-width:76px}
+  .detail{max-height:none}
+  .row.sm .detail{max-height:0; overflow:hidden; opacity:0;
+    transition:max-height .26s ease, opacity .2s ease}
+  .row.sm .detail>*:first-child{margin-top:0}
+  .row.sm .num b{display:none}       /* 完成项不必逐条复述 100% */
+  .row.sm .num span{margin-top:0}
+  .row.sm:hover .detail,.row.sm:focus-within .detail{max-height:240px; opacity:1}
+  @media (hover:none){ .row.sm .detail{max-height:none; opacity:1} }
   @media (prefers-reduced-motion:reduce){
     body::before{animation:none} .bar>i::after{animation:none}
     .row.active::before{animation:none} .dot{animation:none}
+    .row.sm .detail{transition:none} .chev{transition:none}
   }
 </style>
 </head>
@@ -179,6 +233,8 @@
       <h1 id="title">任务进度</h1>
       <div class="sub" id="sub">等待数据…</div>
       <div class="live" id="live"><span class="dot"></span><span id="liveTxt">实时连接</span></div>
+      <!-- 批次隔离：一个批次一个运行目录，这里切回已归档的批次 -->
+      <select class="batchpick" id="batchPick" aria-label="切换批次" title="切换批次"></select>
     </div>
     <div class="ring">
       <svg width="148" height="148" viewBox="0 0 148 148" aria-hidden="true">
@@ -211,7 +267,26 @@
 
   <div class="groups" id="groups"></div>
 
-  <div class="list" id="list"></div>
+  <section class="zone zone-live">
+    <div class="zhead" id="hLive" hidden>
+      <span class="zname">执行中</span>
+      <span class="zcount" id="cLive">0</span>
+      <span class="zline"></span>
+    </div>
+    <div class="list" id="list"></div>
+  </section>
+
+  <section class="zone done-zone" id="zoneDone" hidden>
+    <button class="zhead ztoggle" id="doneToggle" type="button"
+            aria-expanded="true" aria-controls="listDone">
+      <span class="chev" aria-hidden="true"></span>
+      <span class="zname">已完成</span>
+      <span class="zcount" id="cDone">0</span>
+      <span class="zhint">悬停单条展开详情</span>
+      <span class="zline"></span>
+    </button>
+    <div class="list list-done" id="listDone"></div>
+  </section>
 
   <div class="ticker">
     <h2>Event Stream</h2>
@@ -229,7 +304,10 @@ const POLL = 700, POLL_HIDDEN = 3000;
 function fmt(s) {
   if (s === null || s === undefined || isNaN(s)) return '—';
   s = Math.max(0, Math.round(s));
-  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+  const d = Math.floor(s / 86400);
+  const h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+  /* 超过一天拆出「天」：415h06m41s 这种读法看不出量级，而且秒位在这里没有意义 */
+  if (d) return `${d}天${h}h${String(m).padStart(2, '0')}m`;
   if (h) return `${h}h${String(m).padStart(2, '0')}m${String(x).padStart(2, '0')}s`;
   return m ? `${m}m${String(x).padStart(2, '0')}s` : `${x}s`;
 }
@@ -276,12 +354,14 @@ function makeRow() {
     <div class="idx"></div>
     <div class="meta">
       <div class="ttl"></div>
-      <div class="tags">
-        <span class="grp"></span><span class="badge"></span><span class="up"></span>
-        <span class="dur"></span><span class="pred"></span><span class="tid"></span>
+      <div class="detail">
+        <div class="tags">
+          <span class="grp"></span><span class="badge"></span><span class="up"></span>
+          <span class="dur"></span><span class="pred"></span><span class="tid"></span>
+        </div>
+        <div class="bar"><i></i></div>
+        <div class="note"></div>
       </div>
-      <div class="bar"><i></i></div>
-      <div class="note"></div>
     </div>
     <div class="num"><b></b><span></span></div>`;
   return {
@@ -296,28 +376,49 @@ function makeRow() {
   };
 }
 
+/* 只在需要时搬动节点：每轮重建会打断 CSS 过渡，还会让悬停中的行塌回去。
+   跨分区移动（排队 → 完成）走的是同一条路径，先摘除再插入。 */
+function place(box, el, at) {
+  /* box.children 是真 DOM 的 HTMLCollection：它没有 indexOf，必须先转数组。
+     （测试桩里 children 是普通数组，所以这里踩过一次「测试全绿、页面空白」） */
+  const kids = Array.from(box.children);
+  const i = kids.indexOf(el);
+  if (i >= 0 && (at === el || kids[i + 1] === (at || undefined))) return;
+  el.remove();
+  box.insertBefore(el, at || null);
+}
+
 function renderTasks(tasks) {
-  const list = $('list');
+  const liveBox = $('list'), doneBox = $('listDone');
+  const zoneDone = $('zoneDone');
+
   if (!tasks.length) {
     for (const n of nodes.values()) n.el.remove();
     nodes.clear();
-    if (!list.querySelector('.empty')) {
-      list.innerHTML = '<div class="empty"><b>尚无任务数据</b>启动管线后此处会实时刷新</div>';
-    }
+    liveBox.innerHTML = ''; doneBox.innerHTML = '';
+    liveBox.innerHTML = '<div class="empty"><b>尚无任务数据</b>启动管线后此处会实时刷新</div>';
+    setText($('cLive'), '0'); setText($('cDone'), '0');
+    $('hLive').hidden = true; zoneDone.hidden = true;
     return;
   }
-  const empty = list.querySelector('.empty');
-  if (empty) empty.remove();
+  for (const box of [liveBox, doneBox]) {
+    const e = box.querySelector('.empty');
+    if (e) e.remove();
+  }
 
   const seen = new Set();
+  let liveN = 0, doneN = 0;
   tasks.forEach((t, i) => {
     seen.add(t.id);
     let n = nodes.get(t.id);
     if (!n) { n = makeRow(); nodes.set(t.id, n); }
 
     const st = t.stage || 'queued';
+    const isDone = st === 'done';
     n.t = t;            /* 本地时钟推进要读它 —— 漏赋值会让任务行的时间静默不更新 */
-    setClass(n.el, 'row ' + rowClass(st));            /* 类名不变则不动，避免动画重启 */
+    /* 完成项多一个 .sm：默认只留摘要行，悬停 / 聚焦才展开 .detail。
+       类名不变则不动，避免动画重启 */
+    setClass(n.el, 'row ' + rowClass(st) + (isDone ? ' sm' : ''));
     setText(n.idx, String(i + 1).padStart(2, '0'));
     setText(n.ttl, t.title);
     setAttr(n.ttl, 'title', t.title);
@@ -337,18 +438,25 @@ function renderTasks(tasks) {
     else n.note.style.display = 'none';
     setClass(n.note, 'note' + (st === 'fail' ? ' warn' : ''));
 
-    if (st === 'done')      { setText(n.num, '100%'); setText(n.sub, fmt(t.elapsed)); }
+    if (isDone)             { setText(n.num, '100%'); setText(n.sub, fmt(t.elapsed)); }
     else if (st === 'fail') { setText(n.num, (t.pct || 0).toFixed(0) + '%'); setText(n.sub, '已中断'); }
     else {
       setText(n.num, (t.pct || 0).toFixed(0) + '%');
       setText(n.sub, taskTimeText(t, 0));
     }
-    /* 顺序与后端一致（列表很短，直接对齐位置即可） */
-    const at = list.children[i];
-    if (at !== n.el) list.insertBefore(n.el, at || null);
+    /* 两个分区各自保持后端给的相对次序 */
+    const box = isDone ? doneBox : liveBox;
+    place(box, n.el, box.children[isDone ? doneN++ : liveN++] || null);
   });
 
   for (const [id, n] of nodes) if (!seen.has(id)) { n.el.remove(); nodes.delete(id); }
+
+  /* 分区标题只在两侧都有内容时出现 —— 只有一个列表时，多一行标签是噪音 */
+  const nLive = liveBox.children.length, nDone = doneBox.children.length;
+  setText($('cLive'), String(nLive));
+  setText($('cDone'), String(nDone));
+  $('hLive').hidden = !(nLive && nDone);
+  zoneDone.hidden = !nDone;
 }
 
 /* ---------- 任务组（两个 skill 共用一个看板时区分来源） ---------- */
@@ -457,7 +565,9 @@ function paintTopTimes() {
   const o = base.o;
   if (!o) return;
   const d = drift(), age = dataAge(), sub = $('sub');
-  setText($('sElapsed'), fmt((o.elapsed ?? 0) + d));
+  /* 已耗时＝各已完成任务的耗时合计，是累加值不是秒表：没有任务在跑时就不该涨，
+     所以不带 drift(d)。原先它是「目录年龄」，带 d 是为了让它看起来在走。 */
+  setText($('sElapsed'), fmt(o.elapsed));
   setText($('sEta'), topEtaText(o, d, !!(o.total && (o.done + o.failed) === o.total)));
   const src = o.rate_src === 'observed' ? '实测'
             : o.rate_src === 'batch' ? '批量参考' : '单条';
@@ -508,9 +618,38 @@ function setLive(ok) {
   setText($('liveTxt'), ok ? '实时连接' : '连接中断，重试中…');
 }
 
+/* ---------- 批次切换（一个批次一个运行目录，见 progress_hub.rotate_batch） ---------- */
+let batchName = null, batchSig = '';
+
+async function loadBatches() {
+  const sel = $('batchPick');
+  if (!sel) return;
+  try {
+    const r = await fetch('/api/batches', {cache: 'no-store'});
+    if (!r.ok) return;
+    const d = await r.json();
+    const rows = [d.current].concat(d.batches || []);
+    const sig = rows.map(b => b.name + '|' + (b.done || 0) + '/' + (b.total || 0)).join(',');
+    if (sig === batchSig) { sel.value = batchName || 'current'; return; }
+    batchSig = sig;                      /* 变了才重建，免得把展开中的下拉收回去 */
+    sel.innerHTML = rows.map(b => {
+      const tag = b.name === 'current' ? '当前批' : '归档';
+      const label = tag + ' · ' + (b.title || b.name) + ' · ' + (b.done || 0) + '/' + (b.total || 0);
+      return '<option value="' + esc(b.name) + '">' + esc(label) + '</option>';
+    }).join('');
+    sel.classList.toggle('on', rows.length > 1);   /* 还没有归档批次就不占地方 */
+    const keep = rows.some(b => b.name === batchName) ? (batchName || 'current') : 'current';
+    sel.value = keep;
+    batchName = keep === 'current' ? null : keep;
+  } catch (e) { /* 取不到批次列表不影响主视图 */ }
+}
+
+const stateUrl = () => '/api/state'
+  + (batchName ? '?batch=' + encodeURIComponent(batchName) : '');
+
 async function tick() {
   try {
-    const r = await fetch('/api/state', {cache: 'no-store'});
+    const r = await fetch(stateUrl(), {cache: 'no-store'});
     if (!r.ok) throw new Error(r.status);
     const d = await r.json();
     /* 基准时刻取本地钟：只用于算“距上次更新多久”，不跨机比较，省掉时钟同步 */
@@ -519,6 +658,7 @@ async function tick() {
     renderGroups(d.groups || []);
     renderTasks(d.tasks || []);
     renderLog(d.log || []);
+    loadBatches();
     setLive(true);
   } catch (e) {
     setLive(false);
@@ -538,8 +678,24 @@ function schedule() {
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) { nextAt = 0; tick(); }
 });
+/* ---------- 已完成分区：整区折叠（默认展开为摘要行） ---------- */
+const doneZone = $('zoneDone'), doneToggle = $('doneToggle');
+if (doneToggle) {
+  doneToggle.addEventListener('click', () => {
+    const folded = !doneZone.classList.contains('folded');
+    doneZone.classList.toggle('folded', folded);
+    /* 状态写进 aria-expanded：收起后键盘与读屏用户仍知道里面有多少条 */
+    setAttr(doneToggle, 'aria-expanded', folded ? 'false' : 'true');
+  });
+}
+
 /* 本地时钟：只重写时间文本（setText 自带 diff），不受轮询节拍影响 */
 setInterval(() => { paintTopTimes(); paintTaskTimes(); }, UI_TICK);
+const pick = $('batchPick');
+if (pick) pick.addEventListener('change', e => {
+  batchName = e.target.value === 'current' ? null : e.target.value;
+  tick();          /* 立即拉一次；下一拍本来也排着，多这一次只发生在切换时 */
+});
 tick();
 </script>
 </body>

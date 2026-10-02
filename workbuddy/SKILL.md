@@ -1,7 +1,7 @@
 ---
 name: bilibili-video-summary
 description: 用户发送 B站（bilibili）视频链接、BV号、av号或 b23.tv 短链，要求总结视频观点/要点/内容，或要求把视频内容整理成知识库条目时使用。三条路由自动选择：优先字幕直取（秒级，需登录态），无字幕或字幕不可信时走本地 ASR（whisper / Fun-ASR-Nano 双引擎，GPU 加速），再基于全文生成 14 节知识库条目（含 YAML 元数据、检索入口表、实体表、时间线、待验证清单、术语表）。触发词：B站、bilibili、BV号、b23.tv、这个视频讲了什么、总结视频、视频要点、存知识库、知识库条目、B站归档。
-version: 2.7.2
+version: 2.8.0
 agent_created: true
 ---
 
@@ -681,6 +681,12 @@ Windows 上 `msedge.exe` / `chrome.exe` 通常**不在 PATH**，脚本内置常�
 3. 否则从**当前目录**向上找含 `.workbuddy` 的目录 → `<该目录>/.workbuddy/cache/progress/current`
 4. 都找不到 → 不启用（**绝不在任意 cwd 下创建**）
 
+**批次隔离（2026-10-02）**：运行目录名固定是 `current`，但每个批次只写自己那一份 ——
+一次新的转写运行（批量或单条）会把上一批整份搬进 `batches/<时间>-<来源>/`，再重建空的
+`current`。看板看到的始终是「本批」，历史批在顶部的选择器里切回。手工开一批用
+`progress_hub.py --init --new-batch --tasks ...`；列出已归档批次用 `--list-batches`。
+⚠️ **补数据、登记待编译的一方不要传 `new_batch`** —— 那会连自己刚写进去的一起搬走。
+
 > ⚠️ **上报链路 `try/except` 全吞**：运行目录解析失败或上报未启用时，**退出码仍是 0、零日志**，从外部看不出被跳过。要确认在跑，看运行目录下有没有 `events_*.jsonl`。
 
 ⚠️ **看板服务必须由用户手动常驻一次**：`ensure_serving()` 能在同一条命令内拉起服务
@@ -701,18 +707,33 @@ BILI_PROGRESS=off python bili_asr.py ...        # 单次关闭
 | 场景 | 谁上报 | 方式 |
 |---|---|---|
 | 转写 | `bili_asr.py`（下载/转码阶段）+ `funasr_adapter.py`（转写阶段） | 自动 |
-| 生成纪要 | 我（主 agent） | 命令行 `--emit` |
+| 生成纪要 | 我（主 agent） | `notes_done.py` 对账补发（原先靠命令行 `--emit`，实测漏发 7 次） |
 | 其它脚本 | 任意进程 | `import progress_hub; progress_hub.auto(task=..., stage=..., pct=...)` |
 
-**主 agent 的两个上报点（缺一不可）**：转写脚本只报到 `transcribed`（待生成纪要），
-「已完成」由我发出。少发一个，任务会一直挂在「待生成纪要」上或反过来提前宣布完成。
+**上报点**：转写脚本只报到 `transcribed`（待生成纪要），「已完成」由写纪要的一方发出。
 `--kind` 是可选的事件角色（`begin` / `report` / `end`），只为让事件流好回看，**不影响状态判定**。
 
+「已完成」原先靠人工执行 `--emit`，实测累计漏了 7 次（3 次发到了纪要文件名下、4 次完全没发），
+任务因此长期挂在「待生成纪要」。现已改为对账：`notes_done.py` 扫出「看板里停在非终态的 BV 任务」，
+只要它的标准纪要文件已经落在 `--raw-dir` 里，就补发完成信号。配不上就跳过并说明原因，绝不编造完成。
+
+⚠️ **转写侧的「已完成」只到纪要，编译是另一件事。** 补发完成时会**顺带登记一条「待编译」**
+（编译侧以纪要文件名登记，`group` 是 `wiki编译`）。少了这一步，看板会把「只到纪要」显示成整批全部完成
+—— 实盘 2026-10-02 就出现过 4 条没编译、看板却报 27/27 的情况。不打算编译的批次加 `--no-pending` 关掉。
+
 ```bash
-# 开始生成纪要时（把这一阶段的时间起算点划出来）
+# 纪要写完后补发，整批一次跑完；幂等，重复执行不会重复上报
+python scripts/notes_done.py                # 运行目录/纪要目录/素材包目录自动推导
+python scripts/notes_done.py --dry-run      # 只列出会补哪些，不上报
+python scripts/notes_done.py --no-pending   # 只补完成，不登记待编译
+```
+
+台账流程不用手动跑：`library_queue.py --finish` 回写「已完成」成功后会顺带补发该条。
+
+**报告「生成纪要中」时仍可手动划出起算点**：
+
+```bash
 python scripts/progress_hub.py --emit --task <BV号> --stage notes --kind begin --note '生成纪要中'
-# 纪要写完、归档完成后
-python scripts/progress_hub.py --emit --task <BV号> --stage done --kind end --elapsed <本轮总秒数> --note '已完成'
 ```
 
 **由 `BILI_PROGRESS_DIR` 指定运行目录**——未设置时按项目自动推导（见上）；`BILI_PROGRESS=off` 时上报代码是空操作，零开销、零行为变化：

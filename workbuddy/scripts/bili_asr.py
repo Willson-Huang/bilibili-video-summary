@@ -489,8 +489,9 @@ def _prog_boot(p, items, title='B站视频转录'):
                 pass
             tasks.append(rec)
         if tasks:
+            # 一次批量转写＝一个批次：先把上一批整份归档，再写这一批（批次隔离）
             p.init_run(tasks, title=title, d=d, group=PROG_GROUP,
-                       meta={'engine': 'funasr-nano'})
+                       meta={'engine': 'funasr-nano'}, new_batch=True)
         return url
     except Exception:
         return None
@@ -932,7 +933,7 @@ def process_video(a, url_arg, out_path=None, holder=None, preset=None):
                            'duration_sec': pinfo.get('duration') or V['duration'],
                            'engine': a.engine, 'group': PROG_GROUP}],
                          title='B站视频转录', d=_pb.progress_dir(), group=PROG_GROUP,
-                         meta={'engine': a.engine})
+                         meta={'engine': a.engine}, new_batch=True)
         except Exception:
             pass
 

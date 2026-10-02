@@ -51,7 +51,8 @@
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
-| **[v2.7.2](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.2)** | 2026-09-29 | 便携版凭据路径修正（导出的 Cookie 此前读不到）· 条目格式对齐知识库 · 文档精简 280 行 |
+| **[v2.8.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.8.0)** | 2026-10-02 | 看板批次隔离（一个批次一个运行目录）· 未编译的看得见（新增「待编译」阶段 + 收尾信号自动对账）· 「已耗时」改回任务实测耗时 |
+| [v2.7.2](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.2) | 2026-09-29 | 便携版凭据路径修正（导出的 Cookie 此前读不到）· 条目格式对齐知识库 · 文档精简 280 行 |
 | [v2.7.1](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.1) | 2026-09-28 | 自测在非 UTC+8 的机器上不再误报失败 · 补上 CI（2 构建 × Windows/Linux） |
 | [v2.7.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.0) | 2026-09-27 | 看板的数字都有依据（预计剩余三档倍率）· 阶段模型补齐（转写完成≠任务完成）· 队列与台账的静默失败修复 |
 | [v2.6.9](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.6.9) | 2026-09-24 | 校验输出改走文件 · 子代理中间文件位置约束 · 派发后主线程不空等 · 维护与记账规则 |
@@ -224,6 +225,7 @@ python tests/test_core.py
 | `process_queue.py` | `--init` · `--status` · `--limit N` · `--bvid BV号` | CSV 队列：初始化 · 看状态 · 限量 · 只处理指定条目 |
 | | `--retry-failed` · `--meta-only` | 重跑失败行 · 只补元信息 |
 | `progress_hub.py` | `--serve` · `--demo` · `--emit` | 起看板 · 生成演示数据 · 上报一条事件 |
+| | `--list-batches` · `--init --new-batch` | 列出已归档批次 · 开一批新运行（上一批自动归档） |
 | | `--compact` · `--reset` | 裁剪跨批次历史 · 清空运行目录 |
 
 完整参数与更多用法见 [`portable/SKILL.md`](./portable/SKILL.md)。
@@ -367,10 +369,11 @@ bilibili-video-summary/
 ├── examples/            # 真实产出示例（本工具自己生成的 14 节纪要）
 ├── workbuddy/           # WorkBuddy 原版
 │   ├── SKILL.md         # 完整指令（含资料库队列与 IMA 归档的用法）
-│   ├── scripts/         # 与便携版同名的脚本，另含三个专有脚本：
+│   ├── scripts/         # 与便携版同名的脚本，另含四个专有脚本：
 │   │                    #   library_queue.py   资料库在线表队列
 │   │                    #   ima_cos_upload.py  IMA 知识库上传
 │   │                    #   baseline_errors.py 错字基线体检（只读）
+│   │                    #   notes_done.py      收尾对账：纪要写完自动补发完成信号
 │   ├── references/      # 与便携版同名（引擎白名单等按本机情况回填）
 │   └── tests/           # 与便携版同名
 └── portable/            # 便携版（无平台依赖）

@@ -320,7 +320,9 @@ def main():
 
         t1 = time.time()
         # 统一按批量处理（单条视为 1 条批量）：一次加载模型，逐条 generate
-        items = ([{'key': 'single', 'audio': a.audio}] if a.audio
+        # 单条模式的 key 取音频路径：文件名里带 BV 号，task_of() 会把它取出来。
+        # 写死成占位名会让进度落到一个无名任务下，与 run.json 登记的 BV 行对不上号。
+        items = ([{'key': a.audio, 'audio': a.audio}] if a.audio
                  else json.loads(Path(a.batch_json).read_text(encoding='utf-8')))
         per_item = []
         for it in items:

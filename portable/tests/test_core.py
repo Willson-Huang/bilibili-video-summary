@@ -32,7 +32,8 @@ try:
 except Exception:
     lq = None
 
-NEED_LQ = ('test_index_heal', 'test_finish_guards', 'test_dedup_skip', 'test_audit_fixes')
+NEED_LQ = ('test_index_heal', 'test_finish_guards', 'test_dedup_skip', 'test_audit_fixes',
+           'test_notes_done')
 
 FAILS = []
 
@@ -177,6 +178,12 @@ def test_progress_hub():
         o = snap['overall']
         check('总数为 3', o['total'] == 3, f'实际 {o["total"]}')
         check('done / active 计数正确', o['done'] == 1 and o['active'] == 1, f'{o}')
+        # 「已耗时」＝各已完成任务的实测耗时合计。回归：它曾算成 eff_now − created
+        # （运行目录的建立时刻），而目录不按批次隔离 → 界面上显示成「目录存在了多久」
+        # （实盘 2026-10-02：415h06m41s，而任务实际耗时合计只有 3 小时多）。
+        check('已耗时 = 已完成任务的耗时合计',
+              o['elapsed'] == marks['elapsed'],
+              f'-> {o["elapsed"]}（应为 {marks["elapsed"]}，不是目录年龄）')
         # 无任何事件的任务必须落在 queued（不能被静默丢掉，否则总进度分母会缩水）
         c = rows['BVc']
         check('无事件任务为排队且 0%', c['stage'] == 'queued' and c['pct'] == 0.0,
@@ -449,6 +456,216 @@ def test_index_heal():
         check('无素材包不编造字段', (not item3) and healed3 is False, f'-> {item3} / {healed3}')
         check('无素材包不新建索引行',
               'BV1NOPACK000' not in json.loads((cache / 'index.json').read_text(encoding='utf-8')))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_notes_done():
+    """纪要写完自动补发完成信号：配对、幂等、标点差异、拒绝猜测。
+
+    这一步原先靠人工执行 --emit，实测累计漏了 7 次；脚本化之后必须保证它既会补，
+    也不会乱补（配不上就跳过，绝不为「让数字好看」编造一条完成）。
+    """
+    import shutil
+    import notes_done as nd
+
+    def fresh(d):
+        getattr(ph, '_RAW_CACHE', {}).clear()
+
+    tmp = Path(tempfile.mkdtemp(prefix='bili_notes_done_test_'))
+    try:
+        lib = tmp / 'lib'
+        cache = lib / '.workbuddy' / 'cache' / 'bili'
+        arch = lib / '.workbuddy' / 'cache' / 'bili_subs'
+        raw = lib / 'raw'
+        run = lib / '.workbuddy' / 'cache' / 'progress' / 'current'
+        for d in (cache, arch, raw, run):
+            d.mkdir(parents=True, exist_ok=True)
+
+        def pack(bv, title):
+            (arch / f'bili_{bv}.md').write_text(
+                '# B站视频素材包（本地 ASR 转写）\n\n## 基本信息\n'
+                f'- 标题：{title}\n'
+                f'- BV号：{bv} ｜ av号：1 ｜ cid：2 ｜ 分P：1/1\n'
+                '- UP主：某某UP（mid:123）\n'
+                '- 发布：2026-09-02 19:00 ｜ 时长：24:25\n', encoding='utf-8')
+
+        def stage_of(bv):
+            """按编号取状态：run.json 会累积多批任务，按下标取会取到别的批次。"""
+            fresh(run)
+            return next(t['stage'] for t in ph.snapshot(run)['tasks'] if t['id'] == bv)
+
+        # 1 号：素材包头部用直引号，磁盘文件名用中文弯引号（实测里的真实差异）
+        bv1, title1 = 'BV1DONETEST1', '会议纪要"上"：测试'
+        pack(bv1, title1)
+        (raw / '2026-09-02_会议纪要“上”：测试_某某UP_纪要.md').write_text('正文', encoding='utf-8')
+        ph.init_run([{'id': bv1, 'title': title1, 'up': '某某UP', 'duration_sec': 1465}],
+                    title='测试批次', d=run)
+        ph.emit(task=bv1, stage='asr', pct=50.0, d=run)
+        ph.emit(task=bv1, stage='transcribed', pct=100.0, elapsed=300.0, d=run)
+        check('补发前停在待生成纪要', stage_of(bv1) == 'transcribed')
+
+        got = nd.reconcile(run, str(raw), str(cache))
+        row = (got.get('items') or [{}])[0]
+        check('标点差异仍能配对', got.get('done') == 1 and row.get('note_file'), f'-> {row}')
+        check('真的写入了完成事件', row.get('emitted') is True, f'-> {row}')
+        check('补发后状态为已完成', stage_of(bv1) == 'done')
+        check('耗时取自纪要文件时间与转写结束之差',
+              row.get('elapsed') is not None and row['elapsed'] >= 0, f'-> {row.get("elapsed")}')
+
+        # 顺带把「待编译」挂上看板：转写侧的完成只到纪要，编译是另一件事
+        check('补发时顺带登记了待编译', row.get('pending') is True, f'-> {row.get("pending")}')
+        fresh(run)
+        comp = [t for t in ph.snapshot(run)['tasks'] if t.get('stage') == 'pending']
+        check('待编译条目进了看板', len(comp) == 1, f'-> {len(comp)} 条')
+        check('待编译条目落在编译组、名字是纪要文件名',
+              bool(comp) and comp[0].get('group') == 'wiki编译'
+              and comp[0]['id'].endswith('_某某UP_纪要'),
+              f'-> {comp[0] if comp else None}')
+
+        again = nd.reconcile(run, str(raw), str(cache))
+        check('幂等：已完成的任务不再是候选',
+              again.get('done') == 0 and not again.get('items'), f'-> {again}')
+
+        # 2 号：素材包在，纪要没写 → 跳过而不是编造
+        bv2 = 'BV1DONETEST2'
+        pack(bv2, '只有素材包没有纪要')
+        ph.init_run([{'id': bv2, 'title': '只有素材包没有纪要', 'up': '某某UP'}],
+                    title='测试批次', d=run)
+        ph.emit(task=bv2, stage='transcribed', pct=100.0, d=run)
+        got2 = nd.reconcile(run, str(raw), str(cache), only=[bv2])
+        check('纪要不存在时跳过', got2['skipped'] == 1 and '不在目录里' in got2['items'][0]['skipped'],
+              f'-> {got2["items"]}')
+        check('跳过时不写入完成事件', stage_of(bv2) != 'done')
+
+        # 3 号：两个文件名都不是标准名、却归一化到同一个键 → 拒绝猜测
+        #（直引号在 Windows 上不能出现在文件名里，所以用「带弯引号」与「夹空格」两种写法；
+        #  标准名本身不存在，精确匹配落空后才会进入归一化比对）
+        bv3, title3 = 'BV1DONETEST3', '会议纪要"钢之谋断"'
+        pack(bv3, title3)
+        (raw / '2026-09-02_会议纪要“钢之谋断”_某某UP_纪要.md').write_text('甲', encoding='utf-8')
+        (raw / '2026-09-02_会议纪要 钢之谋断_某某UP_纪要.md').write_text('乙', encoding='utf-8')
+        ph.init_run([{'id': bv3, 'title': title3, 'up': '某某UP'}], title='测试批次', d=run)
+        ph.emit(task=bv3, stage='transcribed', pct=100.0, d=run)
+        got3 = nd.reconcile(run, str(raw), str(cache), only=[bv3])
+        check('归一化撞名时拒绝猜测',
+              got3['skipped'] == 1 and '个候选' in got3['items'][0]['skipped'],
+              f'-> {got3["items"]}')
+
+        # 4 号：素材包缺失 → 跳过
+        bv4 = 'BV1DONETEST4'
+        ph.init_run([{'id': bv4, 'title': '没有素材包', 'up': '某某UP'}], title='测试批次', d=run)
+        ph.emit(task=bv4, stage='transcribed', pct=100.0, d=run)
+        got4 = nd.reconcile(run, str(raw), str(cache), only=[bv4])
+        check('素材包缺失时跳过', '素材包不存在' in got4['items'][0]['skipped'], f'-> {got4["items"]}')
+
+        # 5 号：编译条目已存在 → 不重复登记（只补完成）
+        bv5b, title5b = 'BV1DONETEST5', '已经登记过编译'
+        pack(bv5b, title5b)
+        (raw / '2026-09-02_已经登记过编译_某某UP_纪要.md').write_text('正文', encoding='utf-8')
+        ph.init_run([{'id': bv5b, 'title': title5b, 'up': '某某UP'}], title='测试批次', d=run)
+        ph.emit(task=bv5b, stage='transcribed', pct=100.0, d=run)
+        fresh(run)
+        nd.register_pending('2026-09-02_已经登记过编译_某某UP_纪要', d=run)
+        got5b = nd.reconcile(run, str(raw), str(cache), only=[bv5b])
+        check('编译任务已存在时不重复登记',
+              got5b['items'][0].get('pending') == '已登记', f'-> {got5b["items"]}')
+
+        # 6 号：关掉开关 → 只补完成，不登记待编译
+        bv6, title6 = 'BV1DONETEST6', '不登记待编译'
+        pack(bv6, title6)
+        (raw / '2026-09-02_不登记待编译_某某UP_纪要.md').write_text('正文', encoding='utf-8')
+        ph.init_run([{'id': bv6, 'title': title6, 'up': '某某UP'}], title='测试批次', d=run)
+        ph.emit(task=bv6, stage='transcribed', pct=100.0, d=run)
+        fresh(run)
+        got6 = nd.reconcile(run, str(raw), str(cache), only=[bv6], pend=False)
+        check('关闭开关时不登记待编译',
+              'pending' not in got6['items'][0], f'-> {got6["items"]}')
+
+        # 目录推导：只给素材包目录，也能定位运行目录与纪要目录
+        got5 = nd.reconcile(None, None, str(cache), dry=True)
+        check('只给素材包目录也能定位运行目录', got5.get('run_dir') == str(run.resolve()),
+              f'-> {got5.get("run_dir")}')
+        check('只给素材包目录也能定位纪要目录', got5.get('raw_dir') == str(raw.resolve()),
+              f'-> {got5.get("raw_dir")}')
+
+        # 未启用进度上报且没给运行目录 → 明确跳过，不误写
+        keep = os.environ.pop('BILI_PROGRESS_DIR', None)
+        try:
+            check('无运行目录时不误写', 'skipped' in nd.reconcile(None, str(raw), str(cache)))
+        finally:
+            if keep is not None:
+                os.environ['BILI_PROGRESS_DIR'] = keep
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_batch_rotate():
+    """批次隔离：一个批次一个运行目录（2026-10-02）。
+
+    回归：所有批次曾共用一个 run.json，`created` 被首个写入者锁住，任务越滚越多
+    —— 看板的「已耗时」因此量成了目录年龄（415 小时）。
+    """
+    import shutil
+    tmp = Path(tempfile.mkdtemp(prefix='bili_batch_test_'))
+    try:
+        cur = tmp / 'progress' / 'current'
+        cur.mkdir(parents=True)
+
+        # 空目录不该轮转，否则连续开批会留下一串空目录
+        check('空目录不轮转', ph.rotate_batch(cur, group='B站转写') is None)
+        check('空目录连归档根都不建', not (tmp / 'progress' / 'batches').exists())
+
+        # 写入一批后再轮转
+        ph.init_run([{'id': 'BV1BATCH0001', 'title': '甲'}], title='第一批',
+                    d=cur, group='B站转写')
+        ph.emit(task='BV1BATCH0001', stage='asr', pct=50.0, d=cur)
+        (cur / 'hub.json').write_text('{"port":8765}', encoding='utf-8')
+        dst = ph.rotate_batch(cur, group='B站转写')
+        check('轮转返回归档目录', dst is not None and dst.is_dir(), f'-> {dst}')
+        check('归档目录名带上来源', dst.name.endswith('-B站转写'), dst.name)
+        check('清单与事件都随批次搬走',
+              (dst / 'run.json').is_file() and any(dst.glob('events_*.jsonl')),
+              f'-> {sorted(p.name for p in dst.iterdir())}')
+        check('hub.json 留在原地（服务状态不算批次数据）',
+              (cur / 'hub.json').is_file() and not (dst / 'hub.json').exists())
+        check('当前目录里已无清单', not (cur / 'run.json').exists())
+
+        # 目录已空，再轮转不该产生第二个批次
+        check('空目录二次轮转不产生新批次',
+              ph.rotate_batch(cur, group='B站转写') is None
+              and len(list((tmp / 'progress' / 'batches').iterdir())) == 1)
+
+        rows = ph.list_batches(cur)
+        check('list_batches 列出归档批次',
+              len(rows) == 1 and rows[0]['total'] == 1, f'-> {rows}')
+
+        # 先往当前目录写一批（不开新批）
+        ph.init_run([{'id': 'BV1BATCH0002', 'title': '乙'}], title='第二批',
+                    d=cur, group='B站转写')
+
+        # 再开新批：上一批应当被自动归档
+        ph.init_run([{'id': 'BV1BATCH0003', 'title': '丙'}], title='第三批',
+                    d=cur, group='B站转写', new_batch=True)
+        check('开新批会把上一批归档',
+              len(list((tmp / 'progress' / 'batches').iterdir())) == 2)
+        fresh_doc = json.loads((cur / 'run.json').read_text(encoding='utf-8'))
+        ids = [t['id'] for t in fresh_doc['tasks']]
+        check('新批只含本批任务', ids == ['BV1BATCH0003'], f'-> {ids}')
+
+        # 追加任务（补数据、登记待编译）不该触发轮转
+        ph.init_run([{'id': 'BV1BATCH0004', 'title': '丁'}], d=cur, group='wiki编译')
+        check('追加任务不触发轮转',
+              len(list((tmp / 'progress' / 'batches').iterdir())) == 2)
+        rest = json.loads((cur / 'run.json').read_text(encoding='utf-8'))['tasks']
+        check('追加后两份任务并存', len(rest) == 2, f'-> {[t["id"] for t in rest]}')
+
+        # 批次名解析：只有 batches 下的直接子目录能被选中
+        good = ph.list_batches(cur)[0]['name']
+        check('合法批次名解析到该目录', ph.resolve_view_dir(good, cur).name == good)
+        for bad in ('../../secret', '../secret', 'a/b', '', None, 'current', '不存在'):
+            check('非法批次名回退当前批：%r' % bad,
+                  ph.resolve_view_dir(bad, cur) == ph.run_dir(cur))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -756,7 +973,7 @@ def main():
     for fn in (test_resolve_input, test_merge_segments, test_strip_prompt_leak,
                test_mark_ads, test_pack_sections, test_pack_pipeline, test_index_heal,
                test_verify_pack, test_finish_guards, test_dedup_skip, test_progress_hub,
-               test_parse_duration, test_audit_fixes):
+               test_parse_duration, test_notes_done, test_batch_rotate, test_audit_fixes):
         if lq is None and fn.__name__ in NEED_LQ:
             print(f'-- {fn.__name__}  [跳过：本副本无 library_queue.py（便携版）]')
             continue

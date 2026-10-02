@@ -27,8 +27,10 @@ function mkEl(tag) {
   const kids = {};
   const e = {
     tag, textContent: '', className: '', title: '', innerHTML: '',
-    style: {}, children: [], parent: null, _attrs: {},
-    classList: {add() {}, remove() {}, toggle() {}},
+    style: {}, children: [], parent: null, _attrs: {}, hidden: false,
+    /* contains 必须给：已完成分区折叠时脚本要读它判断当前状态 */
+    classList: {add() {}, remove() {}, toggle() {}, contains() { return false; }},
+    addEventListener() {},
     setAttribute(k, v) { this._attrs[k] = v; },
     getAttribute(k) { return k in this._attrs ? this._attrs[k] : null; },
     querySelector(sel) { return kids[sel] = kids[sel] || mkEl('q'); },
@@ -58,7 +60,7 @@ const noop = () => 0;
 const fn = new Function('document', 'fetch', 'setInterval', 'setTimeout', 'clearTimeout',
                         'addEventListener', 'console',
   src + '\n;return {renderTasks,renderGroups,renderLog,paintTopTimes,paintTaskTimes,'
-      + 'taskTimeText,topEtaText,nodes,fmt,ago,drift,dataAge,UI_TICK,cfg,'
+      + 'taskTimeText,topEtaText,nodes,fmt,ago,drift,dataAge,UI_TICK,cfg,place,'
       + 'getBase:()=>base};');
 const api = fn(doc, () => Promise.reject(new Error('stub')), noop, noop, noop, noop, console);
 
@@ -92,7 +94,47 @@ api.renderTasks(TASKS);
 const n2 = api.nodes.get('BV2');
 /* 这一条是本次新增的关键断言：旧实现没有 n.t，任务行的本地时钟推进是无效代码 */
 check('renderTasks 后节点挂上了 t', !!(n2 && 't' in n2), n2 && Object.keys(n2).join(','));
-check('任务行真的插进了列表', byId.list.children.length === 3, byId.list.children.length);
+/* 进行中与已完成拆成两个分区：完成项不再把正在跑的挤到下面 */
+check('进行中分区只有 2 行', byId.list.children.length === 2, byId.list.children.length);
+check('已完成分区只有 1 行', byId.listDone.children.length === 1,
+      byId.listDone.children.length);
+check('完成项落在已完成分区', api.nodes.get('BV1').el.parent === byId.listDone,
+      api.nodes.get('BV1').el.parent === byId.list);
+check('失败项留在进行中分区', api.nodes.get('BV3').el.parent === byId.list,
+      api.nodes.get('BV3').el.parent === byId.listDone);
+const clsOf = id => String(api.nodes.get(id).el.className).split(' ');
+check('完成项带 .sm（默认收起为摘要行）', clsOf('BV1').includes('sm'), clsOf('BV1').join(' '));
+check('进行中项不带 .sm', !clsOf('BV2').includes('sm'), clsOf('BV2').join(' '));
+check('分区计数与行数一致',
+      byId.cLive.textContent === '2' && byId.cDone.textContent === '1',
+      byId.cLive.textContent + ' / ' + byId.cDone.textContent);
+check('两侧都有内容时显示分区标题', byId.hLive.hidden === false, byId.hLive.hidden);
+check('已完成分区显示', byId.zoneDone.hidden === false, byId.zoneDone.hidden);
+/* 完成项跨轮次不重复插入（place 只在位置不对时才搬） */
+api.renderTasks(TASKS);
+check('重复渲染不产生重复节点', byId.listDone.children.length === 1,
+      byId.listDone.children.length);
+/* 任务从进行中变为完成时要跨分区搬动，且不留残影 */
+const moved = TASKS.map(t => t.id === 'BV2' ? Object.assign({}, t, {stage: 'done'}) : t);
+api.renderTasks(moved);
+check('状态翻转后搬到已完成分区', api.nodes.get('BV2').el.parent === byId.listDone,
+      api.nodes.get('BV2').el.parent === byId.list);
+check('搬走后进行中分区只剩 1 行', byId.list.children.length === 1,
+      byId.list.children.length);
+check('搬走后已完成分区 2 行', byId.listDone.children.length === 2,
+      byId.listDone.children.length);
+check('翻转项重新带上 .sm', clsOf('BV2').includes('sm'), clsOf('BV2').join(' '));
+api.renderTasks(TASKS);
+check('翻转回来后从 .sm 摘掉', !clsOf('BV2').includes('sm'), clsOf('BV2').join(' '));
+/* place 直接对 box.children 调 indexOf 会让整个列表渲染抛错、页面空白，
+   而桩里的 children 是普通数组（有 indexOf），所以只靠渲染路径测不出来。
+   这里用「有 length 和数字下标、没有 indexOf」的类 HTMLCollection 兜住这个缺口。 */
+const noProtoColl = Object.assign(Object.create(null), {0: {}, length: 1});
+check('place 不依赖 HTMLCollection 的 indexOf',
+      (() => {
+        try { api.place({children: noProtoColl, insertBefore() {}}, {remove() {}}, null); return 'ok'; }
+        catch (e) { return e.message; }
+      })() === 'ok');
 
 console.log('-- 刚收到数据（数据龄 0）--');
 api.paintTopTimes(); api.paintTaskTimes();
@@ -110,7 +152,8 @@ console.log('-- 数据龄 12s：本地时钟推进，且外推被 STALE_CAP=5 �
 NOW += 12000; api.paintTopTimes(); api.paintTaskTimes();
 check('显示相对时间', byId.sub.textContent.includes('12 秒前'), byId.sub.textContent);
 check('进入 warn 着色', byId.sub.className === 'sub stale-warn', byId.sub.className);
-check('总耗时 = 基准 + 上限 5', byId.sElapsed.textContent === '6m00s', byId.sElapsed.textContent);
+check('总耗时取服务端基准，不随本地时钟推进（它是累加值，不是秒表）',
+      byId.sElapsed.textContent === '5m55s', byId.sElapsed.textContent);
 check('active 已用 100+5', n2.sub.textContent === '1m45s / 剩 3m15s', n2.sub.textContent);
 
 console.log('-- 数据龄 39s --');
@@ -182,6 +225,10 @@ check('59m59s', api.fmt(3599) === '59m59s', api.fmt(3599));
 check('1h00m00s', api.fmt(3600) === '1h00m00s', api.fmt(3600));
 check('1h01m01s', api.fmt(3661) === '1h01m01s', api.fmt(3661));
 check('null → 破折号', api.fmt(null) === '—', api.fmt(null));
+/* 跨过一天要拆出「天」：415h06m41s 这种读法看不出量级 */
+check('刚好一天', api.fmt(86400) === '1天0h00m', api.fmt(86400));
+check('17 天 7 小时 16 分', api.fmt(1494980) === '17天7h16m', api.fmt(1494980));
+check('一天差一秒仍走小时制', api.fmt(86399) === '23h59m59s', api.fmt(86399));
 
 console.log('-- 事件流与任务组能正常渲染（顺带覆盖 renderLog/renderGroups）--');
 api.renderGroups([{name: '转写', total: 3, done: 1, failed: 0, pct: 33.3}]);
