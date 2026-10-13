@@ -1,7 +1,7 @@
 ---
 name: bilibili-video-summary
 description: 用户发送 B站（bilibili）视频链接、BV号、av号或 b23.tv 短链，要求总结视频观点/要点/内容，或要求把视频内容整理成知识库条目时使用。三条路由自动选择：优先字幕直取（秒级，需登录态），无字幕或字幕不可信时走本地 ASR（whisper / Fun-ASR-Nano 双引擎，GPU 加速），再基于全文生成 14 节知识库条目（含 YAML 元数据、检索入口表、实体表、时间线、待验证清单、术语表）。本版本为「便携版」——不依赖 WorkBuddy 与 IMA，纯标准 Python/Node 脚本 + Markdown 指令，可直接装到 Claude / Cursor / ChatGPT 自定义 GPT 等任意支持自定义指令的 AI 平台。触发词：B站、bilibili、BV号、b23.tv、这个视频讲了什么、总结视频、视频要点、存知识库、知识库条目、B站归档。
-version: 2.8.0-portable
+version: 2.9.0-portable
 agent_created: true
 ---
 
@@ -302,6 +302,14 @@ python scripts/process_queue.py --model large-v3
 ## 进度看板（独立窗口）
 
 长任务（10 条 × 25 分钟音频 ≈ 1 小时）看不到进度会让人焦虑。看板把「每条任务当前在做什么、走到几成、还剩多久」实时摊开。**stdlib-only 自建 + 浏览器 `--app` 独立窗口**，零依赖、跨两个 venv 都能用（选型调研、数据流与算法实现见 `references/progress-hub-design.md`）。
+
+### 查看进度（默认用文本）
+
+```bash
+python scripts/progress_hub.py --status          # 打印当前批次：整体进度、每条任务的阶段与耗时
+```
+
+日常看一眼进度用这一条，不起服务、不开浏览器。同一份快照、同样的口径，适合随时随手跑。
 
 ### 启动
 

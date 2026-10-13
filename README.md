@@ -51,7 +51,8 @@
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
-| **[v2.8.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.8.0)** | 2026-10-02 | 看板批次隔离（一个批次一个运行目录）· 未编译的看得见（新增「待编译」阶段 + 收尾信号自动对账）· 「已耗时」改回任务实测耗时 |
+| **[v2.9.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.9.0)** | 2026-10-13 | 命令行查看进度（一条命令打印，不起服务、不开浏览器）· 同一支视频不再在看板上裂成两行 |
+| [v2.8.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.8.0) | 2026-10-02 | 看板批次隔离（一个批次一个运行目录）· 未编译的看得见（新增「待编译」阶段 + 收尾信号自动对账）· 「已耗时」改回任务实测耗时 |
 | [v2.7.2](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.2) | 2026-09-29 | 便携版凭据路径修正（导出的 Cookie 此前读不到）· 条目格式对齐知识库 · 文档精简 280 行 |
 | [v2.7.1](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.1) | 2026-09-28 | 自测在非 UTC+8 的机器上不再误报失败 · 补上 CI（2 构建 × Windows/Linux） |
 | [v2.7.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.0) | 2026-09-27 | 看板的数字都有依据（预计剩余三档倍率）· 阶段模型补齐（转写完成≠任务完成）· 队列与台账的静默失败修复 |
@@ -123,6 +124,27 @@ graph LR
 ## 进度看板（Mission Control）
 
 批量转写动辄几十分钟，这段时间看不到任何进展是最难熬的。v2.6.0 起内置一个零第三方依赖（stdlib only）的独立进度看板，不占用终端，也不会引入包依赖冲突：
+
+**只想看一眼进度**（v2.9.0 起）：一条命令打印到终端，不起服务、不开浏览器，读的是与看板同一份数据。
+
+```bash
+python scripts/progress_hub.py --status
+```
+
+```
+B站视频转录（funasr-nano）
+  整体 52.8%  完成 1/4  在跑 2  失败 0  已耗时 25分55秒  剩余 20分38秒+  更新于 3秒前
+
+  已完成  100.0%  清月聊普通人AI时代如何构建自己的护…  已耗时 25分55秒
+  转写中   42.5%  中世纪步步高升 P1  已耗时 7分03秒  剩余 0秒  超出预估
+  排队     0.0%  材料力学绪论  已耗时 -  剩余 20分38秒
+  待编译    0.0%  编译 2026-10-05_【明星社会学】追星…  已耗时 -  剩余 -
+
+  组 B站转写         53.8%  1/3
+  组 wiki编译       0.0%  0/1
+```
+
+**要一直盯着进度**（批量任务跑几十分钟）用带界面的看板：
 
 ![进度看板预览](docs/dashboard-preview.png)
 

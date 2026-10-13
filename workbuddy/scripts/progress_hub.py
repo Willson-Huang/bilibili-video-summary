@@ -8,8 +8,9 @@
 写入端：管线任意进程调用 emit()，把自己进程的进度事件追加到
         <run_dir>/events_<pid>.jsonl。**每进程独立文件**，不抢锁、不会交错损坏，
         进程崩了也只丢自己那一份。
-读取端：--serve 起一个 HTTP 服务，聚合 run.json + 未退役的 events_*.jsonl +
-        state_snapshot.json，输出 /api/state 给 dashboard.html 轮询。
+读取端：--status 打印纯文本进度（默认，日常查看用）；--serve 起一个 HTTP 服务，
+        聚合 run.json + 未退役的 events_*.jsonl + state_snapshot.json，
+        输出 /api/state 给 dashboard.html 轮询（大批量任务时持续盯进度用）。
 
 为什么不用现成方案：GitHub 上的进度项目（tqdm / rich / enlighten / textual）
 都是"终端里的进度条"，成不了独立窗口；引入 textual 还要在有依赖冲突风险的
@@ -17,6 +18,7 @@ venv 里装包。本方案零依赖、样式自由，且能同时承载转写与
 
 用法
 ----
+  python progress_hub.py --status                # 打印当前批次进度（纯文本）
   python progress_hub.py --init --tasks tasks.json --title "批次二"
   python progress_hub.py --serve --port 8765 --open
   python progress_hub.py --emit --task BV1xxx --stage asr --pct 42.5
@@ -35,6 +37,7 @@ import os
 import sys
 import threading
 import time
+import unicodedata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -245,19 +248,35 @@ def batch_overview(d=None):
 
 
 _BV_RE = None
+_FV_RE = None
 
 
 def task_of(path):
-    """从素材包路径里取任务 ID（BV 号）；取不到就退回文件名。"""
+    """从素材包路径里取任务 ID（BV 号）；取不到就退回文件名。
+
+    文本里出现 BV 号时一律只取那 10 位：素材包取 `out`、音频取 `out` 的同级音轨，
+    文件名带 `_p<N>` 分P 后缀（`BV1XeH66oEre_p1.m4a`）。分P 是同一支视频的不同分段，
+    同属一个任务，前缀必须归并，不然同一支视频会在看板上裂成两行。
+    """
     global _BV_RE
+    global _FV_RE
     if _BV_RE is None:
         import re
         _BV_RE = re.compile(r'(BV[0-9A-Za-z]{10})')
+    if _FV_RE is None:
+        import re
+        _FV_RE = re.compile(r'^(BV[0-9A-Za-z]{10})_p\d+$')
     s = str(path or '')
     m = _BV_RE.search(s)
     if m:
         return m.group(1)
-    return Path(s).stem or s
+    stem = Path(s).stem or s
+    # 调用方把「音频文件名」当任务 id 显式传进来时（如 funasr_adapter 拿到的 key
+    # 就是音轨名），上面那条正则不会命中，这里补一次前缀归并。
+    m2 = _FV_RE.match(stem)
+    if m2:
+        return m2.group(1)
+    return stem
 
 
 def progress_dir():
@@ -638,18 +657,35 @@ def _load_raw(d):
 # --------------------------------------------------------------------------- #
 # 读取端：折叠成看板状态
 # --------------------------------------------------------------------------- #
+def _norm_id(tid):
+    """把「BV 号＋分P 后缀」的任务 id 归并成裸 BV 号。
+
+    仅用于兜住上游显式传进来的 `BV1XeH66oEre_p1`：那类 id 过不了 task_of() 的
+    BV 搜索（会命中），但整串会一直作为独立任务存在，让一支视频裂成两行。
+    其他形态的 id（纪要名、wiki 条目名）原样返回。
+    """
+    global _FV_RE
+    if not tid:
+        return tid
+    if _FV_RE is None:
+        import re
+        _FV_RE = re.compile(r'^(BV[0-9A-Za-z]{10})_p\d+$')
+    m = _FV_RE.match(str(tid))
+    return m.group(1) if m else tid
+
+
 def _fold_tasks(run, events):
     """把任务清单与事件流折叠成 {任务ID: 状态} 与出现顺序。"""
     tasks, order = {}, []
     for t in run.get('tasks', []):
-        tid = t.get('id') or t.get('task')
+        tid = _norm_id(t.get('id') or t.get('task'))
         if not tid:
             continue
         tasks[tid] = dict(t, id=tid, stage='queued', pct=0.0, events=0, log=[])
         order.append(tid)
 
     for e in events:
-        tid = e.get('task')
+        tid = _norm_id(e.get('task'))
         if not tid:
             continue
         if tid not in tasks:
@@ -846,6 +882,68 @@ def snapshot(d=None):
         'tasks': rows,
         'log': list(reversed(log)),
     }
+
+
+def _fmt_sec(sec):
+    """秒数转可读时长；无值显示 '-'。"""
+    if sec is None:
+        return '-'
+    sec = int(round(sec))
+    if sec < 60:
+        return '%d秒' % sec
+    if sec < 3600:
+        return '%d分%02d秒' % (sec // 60, sec % 60)
+    if sec < 86400:
+        return '%d时%02d分' % (sec // 3600, (sec % 3600) // 60)
+    return '%d天%d时' % (sec // 86400, (sec % 86400) // 3600)
+
+
+def _clip(text, limit=34):
+    """按显示宽度截断（全角字符算两列），避免长标题挤掉后面的列。"""
+    out, width = '', 0
+    for ch in str(text):
+        w = 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+        if width + w > limit:
+            return out + '…'
+        out, width = out + ch, width + w
+    return out
+
+
+def print_status(d=None):
+    """纯文本进度输出：读同一份快照，不起服务、不开浏览器。"""
+    snap = snapshot(d)
+    run, ov = snap['run'], snap['overall']
+    stale = ov.get('stale_sec') or 0.0
+    flag = ''
+    if stale > (ov.get('stale_bad') or 0):
+        flag = '（数据已停更 %s）' % _fmt_sec(stale)
+    elif stale > (ov.get('stale_warn') or 0):
+        flag = '（%s 未更新）' % _fmt_sec(stale)
+    eta = _fmt_sec(ov.get('eta'))
+    if ov.get('eta') is not None and not ov.get('eta_complete'):
+        eta = eta + '+'          # 还有任务没有时间依据，剩余时间只能报下限
+    print('%s（%s）' % (run['title'], run['engine']))
+    print('  整体 %.1f%%  完成 %d/%d  在跑 %d  失败 %d  已耗时 %s  剩余 %s  更新于 %s前%s'
+          % (ov['pct'], ov['done'], ov['total'], ov['active'], ov['failed'],
+             _fmt_sec(ov['elapsed']), eta, _fmt_sec(stale) if stale else '0秒', flag))
+    if not snap['tasks']:
+        print('  （这一批还没有任务）')
+        return
+    print('')
+    width = max(len(r['stage_label']) for r in snap['tasks'])
+    for r in snap['tasks']:
+        if r['stage'] in TERMINAL:
+            tail = '已耗时 %s' % _fmt_sec(r.get('elapsed'))
+        else:
+            tail = '已耗时 %s  剩余 %s' % (_fmt_sec(r.get('elapsed')), _fmt_sec(r.get('eta')))
+        if r.get('overrun'):
+            tail += '  超出预估'
+        print('  %-*s %6.1f%%  %s  %s'
+              % (width, r['stage_label'], r['pct'], _clip(r['title'] or r['id']), tail))
+    if len(snap['groups']) > 1:
+        print('')
+        for g in snap['groups']:
+            print('  组 %-12s %.1f%%  %d/%d' % (g['name'], g['pct'], g['done'], g['total']))
 
 
 # --------------------------------------------------------------------------- #
@@ -1214,6 +1312,8 @@ def _demo(d, n=6):
 def main():
     ap = argparse.ArgumentParser(description='任务进度看板')
     ap.add_argument('--dir', default=None, help='运行目录（默认 $BILI_PROGRESS_DIR）')
+    ap.add_argument('--status', action='store_true',
+                    help='打印当前批次的纯文本进度（不起服务、不开浏览器）')
     ap.add_argument('--serve', action='store_true', help='启动看板服务')
     ap.add_argument('--ensure', action='store_true',
                     help='确保看板在跑（已在跑则只返回地址、不重复开窗）；配合 --open 可开窗')
@@ -1286,6 +1386,8 @@ def main():
         print('已%s %d 个任务 -> %s'
               % ('开新批并写入' if a.new_batch else '并入', len(tasks), d))
         return
+    if a.status:
+        return print_status(a.dir)
     if a.list_batches:
         rows = list_batches(a.dir)
         if not rows:
