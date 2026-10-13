@@ -96,10 +96,32 @@ def main():
         raw = sys.stdin.read()
     else:
         raw = a.cred.strip()
+        # 判定顺序：空 -> 目录 -> 文件 -> JSON 串 -> 报错。
+        # 注意 Path('') 在 Windows 上等于 '.', 直接 exists() 会命中当前目录,
+        # 再 read_text() 就抛 PermissionError，报错与真实原因完全无关。
+        if not raw:
+            print(json.dumps({'ok': False,
+                              'error': '缺少凭证：用 --cred <文件> 或 --cred-stdin'},
+                             ensure_ascii=False))
+            sys.exit(1)
         p = Path(raw)
-        if p.exists():
+        if p.is_dir():
+            print(json.dumps({'ok': False,
+                              'error': f'--cred 指向的是目录而非文件：{raw}'},
+                             ensure_ascii=False))
+            sys.exit(1)
+        if p.is_file():
             raw = p.read_text(encoding='utf-8')
-        elif raw:
+        else:
+            # 不是文件就把整串当 JSON 试解析；失败时明确说是路径不存在，
+            # 而不是把 JSONDecodeError 抛给调用方去猜。
+            try:
+                json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                print(json.dumps({'ok': False,
+                                  'error': f'--cred 既不是已存在的文件也不是合法 JSON：{raw[:120]}'},
+                                 ensure_ascii=False))
+                sys.exit(1)
             # 凭证写进命令行会残留在 shell history，且同主机其他用户 ps 可见
             print('[警告] 通过 --cred 直接传凭证字符串不安全，'
                   '建议改用文件路径或 --cred-stdin', file=sys.stderr)

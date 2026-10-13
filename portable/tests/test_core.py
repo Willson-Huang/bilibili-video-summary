@@ -146,6 +146,38 @@ def test_progress_hub():
         check('task_of 从路径取 BV', ph.task_of('x/bili_BV0000000000.md') == 'BV0000000000')
         check('task_of 从 URL 取 BV',
               ph.task_of('https://www.bilibili.com/video/BV1111111111') == 'BV1111111111')
+        # 回归（实盘 2026-10-05）：一支视频裂成两行。素材包取 `out`、音轨取 `out` 的
+        # 同级文件，音轨名是「BV 号_pN」；它一旦被当成 task 显式传进来，就会与 run.json
+        # 登记的裸 BV 号并列成第二行，顶部变成「2 个任务」、总进度被摊薄。
+        check('task_of 归并分P 音轨名', ph.task_of('BV1XeH66oEre_p1') == 'BV1XeH66oEre',
+              ph.task_of('BV1XeH66oEre_p1'))
+        check('task_of 归并分P 音轨路径',
+              ph.task_of('C:/a/BV1XeH66oEre_p12.m4a') == 'BV1XeH66oEre')
+        check('task_of 不误伤非 BV 文件名', ph.task_of('纪要-20260918') == '纪要-20260918')
+        check('_norm_id 归并分P 后缀', ph._norm_id('BV1XeH66oEre_p1') == 'BV1XeH66oEre')
+        check('_norm_id 放行裸 BV', ph._norm_id('BV1XeH66oEre') == 'BV1XeH66oEre')
+        check('_norm_id 放行纪要名', ph._norm_id('编译 某纪要') == '编译 某纪要')
+
+        # 折叠侧兜底：run.json 只登记裸 BV 号，事件却报的是带 _pN 的 id
+        d_dup = Path(tempfile.mkdtemp(prefix='ph_dup_'))
+        try:
+            ph.init_run([{'id': 'BV1XeH66oEre', 'title': '日本手机', 'up': '恶童Talk',
+                          'duration_sec': 856, 'group': 'B站转写'}], d=d_dup)
+            ph.emit(task='BV1XeH66oEre_p1', stage='asr', pct=17.0, src='funasr_adapter',
+                    group='B站转写', d=d_dup)
+            snap_dup = ph.snapshot(d_dup)
+            check('分P 事件不再裂出第二行', snap_dup['overall']['total'] == 1,
+                  f'total={snap_dup["overall"]["total"]} '
+                  f'ids={[r["id"] for r in snap_dup["tasks"]]}')
+            check('分P 事件推进到原任务',
+                  snap_dup['tasks'][0]['stage'] == 'asr'
+                  and snap_dup['tasks'][0]['pct'] == 17.0,
+                  f'{snap_dup["tasks"][0]}')
+            check('原任务标题未被裸 id 覆盖',
+                  snap_dup['tasks'][0]['title'] == '日本手机',
+                  snap_dup['tasks'][0]['title'])
+        finally:
+            shutil.rmtree(d_dup, ignore_errors=True)
 
         # 插值：180s 音频在 Nano 5.08x 下预测约 35.4s
         pct = ph.pct_from_elapsed(17.7, 180.0, 'funasr-nano')
@@ -507,14 +539,16 @@ def test_notes_done():
 
         got = nd.reconcile(run, str(raw), str(cache))
         row = (got.get('items') or [{}])[0]
-        check('标点差异仍能配对', got.get('done') == 1 and row.get('note_file'), f'-> {row}')
+        check('标点差异仍能配对', got.get('done') == 1 and row.get('note_files'), f'-> {row}')
         check('真的写入了完成事件', row.get('emitted') is True, f'-> {row}')
         check('补发后状态为已完成', stage_of(bv1) == 'done')
         check('耗时取自纪要文件时间与转写结束之差',
               row.get('elapsed') is not None and row['elapsed'] >= 0, f'-> {row.get("elapsed")}')
 
         # 顺带把「待编译」挂上看板：转写侧的完成只到纪要，编译是另一件事
-        check('补发时顺带登记了待编译', row.get('pending') is True, f'-> {row.get("pending")}')
+        check('补发时顺带登记了待编译',
+              row.get('pending') == ['2026-09-02_会议纪要“上”：测试_某某UP_纪要'],
+              f'-> {row.get("pending")}')
         fresh(run)
         comp = [t for t in ph.snapshot(run)['tasks'] if t.get('stage') == 'pending']
         check('待编译条目进了看板', len(comp) == 1, f'-> {len(comp)} 条')
@@ -569,7 +603,8 @@ def test_notes_done():
         nd.register_pending('2026-09-02_已经登记过编译_某某UP_纪要', d=run)
         got5b = nd.reconcile(run, str(raw), str(cache), only=[bv5b])
         check('编译任务已存在时不重复登记',
-              got5b['items'][0].get('pending') == '已登记', f'-> {got5b["items"]}')
+              got5b['items'][0].get('pending') == ['2026-09-02_已经登记过编译_某某UP_纪要（已登记）'],
+              f'-> {got5b["items"]}')
 
         # 6 号：关掉开关 → 只补完成，不登记待编译
         bv6, title6 = 'BV1DONETEST6', '不登记待编译'
@@ -581,6 +616,36 @@ def test_notes_done():
         got6 = nd.reconcile(run, str(raw), str(cache), only=[bv6], pend=False)
         check('关闭开关时不登记待编译',
               'pending' not in got6['items'][0], f'-> {got6["items"]}')
+
+        # 7 号：多 P 视频的素材包按页分文件，看板上只有一行 → 每页都要配上纪要才算完
+        bv7 = 'BV1DONETEST7'
+        for page, ptitle in ((1, '多P视频 P1'), (2, '多P视频 P2')):
+            (arch / f'bili_{bv7}_p{page}.md').write_text(
+                '# B站视频素材包（本地 ASR 转写）\n\n## 基本信息\n'
+                f'- 标题：{ptitle}\n'
+                f'- BV号：{bv7} ｜ av号：1 ｜ cid：2 ｜ 分P：{page}/2\n'
+                '- UP主：某某UP（mid:123）\n'
+                '- 发布：2026-09-02 19:00 ｜ 时长：12:00\n', encoding='utf-8')
+        ph.init_run([{'id': bv7, 'title': '多P视频', 'up': '某某UP'}], title='测试批次', d=run)
+        ph.emit(task=bv7, stage='asr', pct=30.0, d=run)
+        ph.emit(task=bv7 + '_p2', stage='transcribed', pct=100.0, d=run)
+        (raw / '2026-09-02_多P视频 P1_某某UP_纪要.md').write_text('甲', encoding='utf-8')
+        got7a = nd.reconcile(run, str(raw), str(cache), only=[bv7])
+        check('多P 素材包按页全部找齐',
+              len(got7a['items'][0].get('pack_files') or []) == 2, f'-> {got7a["items"]}')
+        check('多P 只配上一页时不补发',
+              got7a['skipped'] == 1 and 'P2' in got7a['items'][0]['skipped'],
+              f'-> {got7a["items"]}')
+
+        (raw / '2026-09-02_多P视频 P2_某某UP_纪要.md').write_text('乙', encoding='utf-8')
+        got7b = nd.reconcile(run, str(raw), str(cache), only=[bv7])
+        row7 = got7b['items'][0]
+        check('多P 各页纪要齐了才补发完成',
+              got7b['done'] == 1 and row7.get('emitted') is True, f'-> {row7}')
+        check('多P 每页各登记一条待编译',
+              len(row7.get('pending') or []) == 2, f'-> {row7.get("pending")}')
+        check('分P 事件归并后能算出已用时间',
+              row7.get('elapsed') is not None, f'-> {row7.get("elapsed")}')
 
         # 目录推导：只给素材包目录，也能定位运行目录与纪要目录
         got5 = nd.reconcile(None, None, str(cache), dry=True)
@@ -968,12 +1033,53 @@ def test_audit_fixes():
           ph.stale_thresholds('no-such') == (ph.STALE_WARN_SEC, ph.STALE_BAD_SEC))
 
 
+def test_status_output():
+    """--status 文本输出：内容齐全、空目录不崩。"""
+    import contextlib
+    import io
+    import shutil
+    d = Path(tempfile.mkdtemp(prefix='ph_status_'))
+    try:
+        long_title = '长标题' * 12
+        ph.init_run([{'id': 'BVa', 'title': long_title, 'duration_sec': 1000},
+                     {'id': 'BVb', 'title': 'B', 'duration_sec': 1000}], d=d)
+        ph.emit(task='BVa', stage='done', pct=100.0, elapsed=197.0,
+                duration_sec=1000, title=long_title, d=d)
+        ph.init_run([{'id': 'wiki1', 'title': '编译 某纪要', 'group': 'wiki编译',
+                      'pred_sec': 90}], d=d)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ph.print_status(d)
+        out = buf.getvalue()
+        check('status 打印标题与引擎', '任务批次' in out and 'funasr-nano' in out,
+              out.splitlines()[0])
+        check('status 汇总含完成数', '完成 1/3' in out, out)
+        check('status 列出每个任务', out.count('编译 某纪要') == 1, out)
+        check('status 已完成行显示实测耗时', '3分17秒' in out, out)
+        check('status 多组时打组汇总', '组 wiki编译' in out, out)
+        check('status 长标题按宽度截断', '…' in out)
+        check('_fmt_sec 无值给 -', ph._fmt_sec(None) == '-')
+        check('_fmt_sec 零值给 0秒', ph._fmt_sec(0) == '0秒')
+        check('_clip 按全角宽度截断', len(ph._clip('中' * 40)) < 40, ph._clip('中' * 40))
+        empty = Path(tempfile.mkdtemp(prefix='ph_status_empty_'))
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ph.print_status(empty)
+            check('空目录不崩且提示无任务', '还没有任务' in buf.getvalue(), buf.getvalue())
+        finally:
+            shutil.rmtree(empty, ignore_errors=True)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     print('=== bilibili-video-summary 自测 ===')
     for fn in (test_resolve_input, test_merge_segments, test_strip_prompt_leak,
                test_mark_ads, test_pack_sections, test_pack_pipeline, test_index_heal,
                test_verify_pack, test_finish_guards, test_dedup_skip, test_progress_hub,
-               test_parse_duration, test_notes_done, test_batch_rotate, test_audit_fixes):
+               test_status_output, test_parse_duration, test_notes_done,
+               test_batch_rotate, test_audit_fixes):
         if lq is None and fn.__name__ in NEED_LQ:
             print(f'-- {fn.__name__}  [跳过：本副本无 library_queue.py（便携版）]')
             continue

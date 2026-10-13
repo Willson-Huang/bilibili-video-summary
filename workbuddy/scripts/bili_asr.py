@@ -460,11 +460,13 @@ def _prog():
 PROG_GROUP = 'B站转写'
 
 
-def _prog_boot(p, items, title='B站视频转录'):
+def _prog_boot(p, items, title='B站视频转录', engine='funasr-nano'):
     """启用进度时：单实例拉起看板 + 写入任务清单。
 
     - 看板已在跑就**只复用、不再开窗**（否则跑 20 条会弹 20 个窗口）
     - 标题/时长走 24h 元信息缓存（队列先跑过 --meta-only 时是零请求）
+    - 看板上一行＝一支视频：多 P 视频只登记裸 BV 号，各 P 的事件都归到这一行，
+      页面按页分文件（`bili_<BV>_p<页>.md`），素材包与纪要仍是一页一份
     - 全程尽力而为：任何异常都吞掉，绝不影响转写
     """
     try:
@@ -479,11 +481,15 @@ def _prog_boot(p, items, title='B站视频转录'):
                 _u, page, bv = resolve_input(it.get('url') or '')
             except Exception:
                 continue
-            rec = {'id': bv, 'group': PROG_GROUP, 'engine': 'funasr-nano'}
+            if not bv:
+                continue
+            rec = {'id': bv, 'group': PROG_GROUP, 'engine': engine}
             try:
                 V = fetch_meta(it['url'], page)
                 rec['title'] = V.get('title')
                 rec['up'] = (V.get('owner') or {}).get('name')
+                # 时长取整支视频的总长：多 P 视频看板上只有一行，预计剩余按全片算才
+                # 与实际相符；取某一 P 的时长会把整支视频的剩余时间算成零头。
                 rec['duration_sec'] = V.get('duration')
             except Exception:
                 pass
@@ -491,7 +497,7 @@ def _prog_boot(p, items, title='B站视频转录'):
         if tasks:
             # 一次批量转写＝一个批次：先把上一批整份归档，再写这一批（批次隔离）
             p.init_run(tasks, title=title, d=d, group=PROG_GROUP,
-                       meta={'engine': 'funasr-nano'}, new_batch=True)
+                       meta={'engine': engine}, new_batch=True)
         return url
     except Exception:
         return None
@@ -904,7 +910,7 @@ def build_parser():
     return ap
 
 
-def process_video(a, url_arg, out_path=None, holder=None, preset=None):
+def process_video(a, url_arg, out_path=None, holder=None, preset=None, in_batch=False):
     """处理单个视频，返回结构化结果（不打印）。holder 非空时复用其模型实例。
 
     out_path 留空时按解析出的 BV 与分P 自动命名（av 号链接在 resolve_input 阶段
@@ -913,6 +919,10 @@ def process_video(a, url_arg, out_path=None, holder=None, preset=None):
     preset: dict，批量预转写模式下传入 {'audio': 已下载音频路径, 'segments': 已转写段落,
                                         'engine_meta': {...}}
             传入时跳过下载与转写，直接组装素材包（避免 Nano 每条重复冷启动）。
+
+    in_batch: True 表示由批量循环调用。批量清单已由 _prog_boot 一次性登记过，
+              此时**不能再开新批次**——否则每条都把上一条刚写的清单搬进归档，
+              current 里只剩最后一条（2026-10-03 实测：5 个分P 转完只剩 P5）。
     """
     t_meta = time.time()
     url, page, bvid = resolve_input(url_arg)
@@ -924,7 +934,7 @@ def process_video(a, url_arg, out_path=None, holder=None, preset=None):
 
     # 单条模式：拿到元信息后立刻保证看板在跑并登记任务（单实例，已开则复用）
     _pb = _prog()
-    if _pb:
+    if _pb and not in_batch:
         try:
             os.environ.setdefault('BILI_PROGRESS_GROUP', PROG_GROUP)
             _pb.ensure_serving(_pb.progress_dir(), open_window=True)
@@ -934,6 +944,13 @@ def process_video(a, url_arg, out_path=None, holder=None, preset=None):
                            'engine': a.engine, 'group': PROG_GROUP}],
                          title='B站视频转录', d=_pb.progress_dir(), group=PROG_GROUP,
                          meta={'engine': a.engine}, new_batch=True)
+        except Exception:
+            pass
+    elif _pb and in_batch:
+        # 批量里的单条：清单已登记过，只补上报阶段，不碰批次
+        try:
+            os.environ.setdefault('BILI_PROGRESS_GROUP', PROG_GROUP)
+            _pb.auto(task=_pb.task_of(out_path or url), stage='download', note='准备中…')
         except Exception:
             pass
 
@@ -1150,7 +1167,8 @@ def main():
                             results.append(process_video(
                                 a, rec['url'], rec['out'], holder,
                                 preset={'audio': rec['audio'], 'segments': segs,
-                                        'engine_meta': emeta}))
+                                        'engine_meta': emeta},
+                                in_batch=True))
                             first_nano_result = False
                         except Exception as e:
                             results.append({'ok': False, 'url': rec['url'], 'error': str(e)})
@@ -1177,9 +1195,15 @@ def main():
                               'engine': 'funasr-nano', 'results': results}, ensure_ascii=False))
             return
 
+        # whisper 批量：与 Nano 走同一个 _prog_boot，保证批量也登记看板任务。
+        # 缺这一步时看板只剩上一批的历史数据，本批从头到尾没有卡片（2026-10-03 实测）。
+        _pw = _prog()
+        if _pw:
+            _prog_boot(_pw, items, engine=a.engine)
         for it in items:
             try:
-                results.append(process_video(a, it['url'], it['out'], holder))
+                results.append(process_video(a, it['url'], it['out'], holder,
+                                             in_batch=True))
             except Exception as e:
                 results.append({'ok': False, 'url': it.get('url'), 'error': str(e)})
         print(json.dumps({'ok': True, 'batch': True, 'count': len(results),

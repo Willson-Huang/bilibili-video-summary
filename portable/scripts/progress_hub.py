@@ -256,7 +256,7 @@ def task_of(path):
 
     文本里出现 BV 号时一律只取那 10 位：素材包取 `out`、音频取 `out` 的同级音轨，
     文件名带 `_p<N>` 分P 后缀（`BV1XeH66oEre_p1.m4a`）。分P 是同一支视频的不同分段，
-    同属一个任务，前缀必须归并，不然同一支视频会在看板上裂成两行。
+    看板上合成一行，所以前缀必须归并，不然同一支视频会裂成两行。
     """
     global _BV_RE
     global _FV_RE
@@ -609,49 +609,52 @@ def _read_jsonl(p):
 
 
 def _load_raw(d):
-    """返回 (run, events)。命中签名缓存则直接复用已解析的事件。"""
+    """返回 (run, events)。命中签名缓存则直接复用已解析的事件。
+
+    解析在锁内完成（2026-10-03 修）：原先是「锁内查缓存 → 锁外读文件解析 → 锁内写回」，
+    两个请求同时未命中时会把同一批事件重复解析两遍。ThreadingHTTPServer
+    每个请求一个线程，轮询 + 批次列表 + 首屏请求会并发触发它，
+    任务量大时表现为 CPU 抖动与响应时间忽长忽短。
+    """
     key = str(d)
-    sig = _signature(d)
     with _RAW_LOCK:
+        sig = _signature(d)
         hit = _RAW_CACHE.get(key)
         if hit and hit[0] == sig:
             return hit[1], hit[2]
+        run = {}
+        rp = d / 'run.json'
+        if rp.is_file():
+            try:
+                run = json.loads(rp.read_text(encoding='utf-8'))
+            except Exception:
+                run = {}
 
-    run = {}
-    rp = d / 'run.json'
-    if rp.is_file():
-        try:
-            run = json.loads(rp.read_text(encoding='utf-8'))
-        except Exception:
-            run = {}
+        consumed = set()
+        cp = d / 'consumed.json'
+        if cp.is_file():
+            try:
+                consumed = set(json.loads(cp.read_text(encoding='utf-8')))
+            except Exception:
+                consumed = set()
 
-    consumed = set()
-    cp = d / 'consumed.json'
-    if cp.is_file():
-        try:
-            consumed = set(json.loads(cp.read_text(encoding='utf-8')))
-        except Exception:
-            consumed = set()
-
-    events = []
-    snap = d / 'state_snapshot.json'
-    if snap.is_file():
-        try:
-            doc = json.loads(snap.read_text(encoding='utf-8'))
-            events += doc.get('events', [])
-            if doc.get('run') and not run:
-                run = doc['run']
-        except Exception:
-            pass
-    for p in sorted(d.glob('events_*.jsonl')):
-        if p.name in consumed:
-            continue
-        events += _read_jsonl(p)
-    events.sort(key=lambda e: e.get('ts', 0))
-
-    with _RAW_LOCK:
+        events = []
+        snap = d / 'state_snapshot.json'
+        if snap.is_file():
+            try:
+                doc = json.loads(snap.read_text(encoding='utf-8'))
+                events += doc.get('events', [])
+                if doc.get('run') and not run:
+                    run = doc['run']
+            except Exception:
+                pass
+        for p in sorted(d.glob('events_*.jsonl')):
+            if p.name in consumed:
+                continue
+            events += _read_jsonl(p)
+        events.sort(key=lambda e: e.get('ts', 0))
         _RAW_CACHE[key] = (sig, run, events)
-    return run, events
+        return run, events
 
 
 # --------------------------------------------------------------------------- #
@@ -660,8 +663,8 @@ def _load_raw(d):
 def _norm_id(tid):
     """把「BV 号＋分P 后缀」的任务 id 归并成裸 BV 号。
 
-    仅用于兜住上游显式传进来的 `BV1XeH66oEre_p1`：那类 id 过不了 task_of() 的
-    BV 搜索（会命中），但整串会一直作为独立任务存在，让一支视频裂成两行。
+    上游把音轨名整串当成任务 id 传进来时会落到这里：看板上一行＝一支视频，
+    这类 id 不归并就会给同一支视频单开一行（无标题，显示成裸编号）。
     其他形态的 id（纪要名、wiki 条目名）原样返回。
     """
     global _FV_RE
@@ -1086,12 +1089,59 @@ def _probe(host, port, timeout=0.3):
         return False
 
 
+def _pid_alive(pid):
+    """pid 是否仍存活。取不到（None/非数字）时按"存活"处理，交给 _probe 判定。
+
+    Windows 上 os.kill(pid, 0) 对已退出进程仍可能成功，故额外用
+    OpenProcess 查退出码；两者都不可用时退回 True，绝不因判错而弃掉活着的实例。
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return True
+    if pid <= 0:
+        return False
+    if os.name == 'nt':
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+            if not h:
+                return False                  # 进程不存在或无权限 → 视为已退
+            try:
+                code = ctypes.c_ulong()
+                if k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return code.value == STILL_ACTIVE
+            finally:
+                k32.CloseHandle(h)
+            return True
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                        # 存在但无权限
+    except Exception:
+        return True
+
+
 def find_running(d=None, host='127.0.0.1', port=DEFAULT_PORT, span=0):
     """找出已在运行的看板端口，找不到返回 None。
 
     优先读 `<run_dir>/hub.json` —— 服务启动时自报端口，只需 **1 次**探测。
     `span=0`（默认）不做端口扫描：本机探测一个关闭端口要等满超时（实测 0.3s/个），
     扫 24 个就是 7 秒，绝不能放进常规路径。需要时显式传 span。
+
+    ⚠️ **必须同时校验 pid 存活**（2026-10-03 修「面板闪一下就没了」）：
+    端口可连不等于本看板在跑。端口被别的进程占用时，_probe 会拿到非本看板的
+    响应；hub.json 里的 pid 也可能早已死掉而端口恰好被别人用上。
+    两种情况都会让 find_running 误判"已在跑"→ 复用了一个不通的地址 →
+    面板加载不出来、只剩空白或连接中断指示灯。
     """
     cands = []
     try:
@@ -1099,14 +1149,16 @@ def find_running(d=None, host='127.0.0.1', port=DEFAULT_PORT, span=0):
         if hp.is_file():
             info = json.loads(hp.read_text(encoding='utf-8'))
             if isinstance(info.get('port'), int):
-                cands.append(info['port'])
+                cands.append((info['port'], info.get('pid')))
     except Exception:
         pass
-    if port not in cands:
-        cands.append(port)
+    if not any(p == port for p, _ in cands):
+        cands.append((port, None))
     if span:
-        cands += [port + i for i in range(1, span)]
-    for p in cands:
+        cands += [(port + i, None) for i in range(1, span)]
+    for p, pid in cands:
+        if pid is not None and not _pid_alive(pid):
+            continue                      # 记录指向死进程，不探这个端口
         if _probe(host, p):
             return p
     return None
@@ -1197,8 +1249,15 @@ def serve(d=None, port=DEFAULT_PORT, host='127.0.0.1', open_window=False):
         pass
     print('看板已启动: %s   (运行目录 %s)' % (url, rd), flush=True)
     if open_window:
-        threading.Thread(target=lambda: (_open_app_window(url), None)[1],
-                         daemon=True).start()
+        # 非 daemon 线程：daemon 线程会在主线程退出时连带消失，开窗还没执行就夭折。
+        # 内部自己吞异常，保证开窗失败不影响 serve_forever。
+        def _open():
+            try:
+                _open_app_window(url)
+            except Exception as e:
+                print('开窗失败（服务仍在运行，可手动访问 %s）：%s' % (url, e),
+                      flush=True)
+        threading.Thread(target=_open, daemon=False).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -1260,8 +1319,23 @@ def _open_app_window(url):
         # 独立 profile：否则 --app 会挂进已有浏览器进程，--window-size 会被忽略
         prof = Path.home() / '.workbuddy' / 'tmp' / 'dash_profile'
         try:
-            subprocess.Popen([exe, '--app=%s' % url, '--window-size=1280,900',
-                              '--user-data-dir=%s' % prof], close_fds=True)
+            # 必须让浏览器**脱离**本进程组：不脱离时它是本服务的子进程，
+            # 服务一旦退出（端口耗尽 SystemExit、宿主 Job Object 回收 Ctrl-C），
+            # 浏览器随之被一起收掉，用户看到的就是「面板闪一下就没了」。
+            # 与 _spawn_hub 同一套旗标：BREAKAWAY 被拒时退回 DETACHED| NEW_GROUP。
+            flags = {'close_fds': True, 'stdout': subprocess.DEVNULL,
+                     'stderr': subprocess.DEVNULL, 'stdin': subprocess.DEVNULL}
+            args = [exe, '--app=%s' % url, '--window-size=1280,900',
+                    '--user-data-dir=%s' % prof]
+            if os.name != 'nt':
+                subprocess.Popen(args, start_new_session=True, **flags)
+            else:
+                DETACHED, NEW_GROUP, BREAKAWAY = 0x00000008, 0x00000200, 0x01000000
+                try:
+                    subprocess.Popen(args, creationflags=DETACHED | NEW_GROUP | BREAKAWAY,
+                                     **flags)
+                except OSError:
+                    subprocess.Popen(args, creationflags=DETACHED | NEW_GROUP, **flags)
             print('已用独立窗口打开（%s --app）' % Path(exe).name, flush=True)
             return True
         except Exception:

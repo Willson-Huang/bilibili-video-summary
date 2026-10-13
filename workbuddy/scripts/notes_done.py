@@ -27,6 +27,9 @@ NOTE_SUFFIX = '_纪要.md'
 # 归一化时一律忽略的标点：引号（直/弯两式）与斜杠类。素材包头部与磁盘文件名常一边用
 # 直引号、一边用中文弯引号，逐字比对会漏配；`note_name()` 已经把直引号当非法字符剔除。
 NOISE = str.maketrans('', '', '"\'“”‘’、/\\')
+# 素材包文件名里的页号后缀（`bili_<BV>_p3.md`）。看板上多 P 合并成一行，
+# 这里靠它把该 BV 的各页素材包找齐。
+PART_RE = re.compile(r'_p(\d+)$')
 
 
 def _norm(s):
@@ -104,35 +107,64 @@ def resolve_dirs(raw_dir, cache_dir, run):
 
 
 def pack_paths(cache_dir, bv):
-    """素材包可能的位置：归档目录优先，其次缓存目录。
+    """该任务的全部素材包路径，归档目录优先，其次缓存目录。
 
     归档目录与缓存目录同级（`cache/bili_subs`），与 `library_queue --finish` 的
     归档目标一致 —— 当成子目录会一条都对不上。
+
+    看板上的一行＝一支视频，多 P 视频的 id 是裸 BV 号，而素材包按页分文件
+    （`bili_<BV>_p<页>.md`）。只认 `bili_<BV>.md` 会让多 P 视频被判成
+    「素材包不存在」而永远补发不出完成信号（2026-10-03 实测：ck3 五分P 全部落空）。
     """
-    return [cache_dir.parent / PACK_ARCHIVE_SUBDIR / f'bili_{bv}.md',
-            cache_dir / f'bili_{bv}.md']
+    m = PART_RE.search(str(bv))
+    stem = str(bv)[:m.start()] if m else str(bv)
+    out = []
+    for d in (Path(cache_dir).parent / PACK_ARCHIVE_SUBDIR, Path(cache_dir)):
+        pages = sorted(d.glob(f'bili_{stem}_p*.md'),
+                       key=lambda p: int(PART_RE.search(p.stem).group(1)))
+        out.extend(pages)
+        plain = d / f'bili_{stem}.md'
+        if plain.is_file():
+            out.append(plain)              # 单P 视频只有这一份
+    return out
 
 
 def note_for(bv, cache_dir, raw_dir):
-    """返回 (纪要文件, 素材包, 跳过原因)。三者只有一组非空。"""
-    for p in pack_paths(cache_dir, bv):
-        if not p.is_file():
-            continue
+    """返回 (纪要文件列表, 素材包列表, 跳过原因)。前两者只有一组非空。
+
+    多 P 视频要每一页都配到纪要才算写完：看板只有一行，只配上一页就补发完成，
+    会把还没写纪要的页一起报成已完成。
+    """
+    packs = pack_paths(cache_dir, bv)
+    if not packs:
+        return None, None, '素材包不存在'
+    notes, why = [], None
+    for p in packs:
         head = lq.parse_pack_header(p)
         missing = [k for k in ('pubdate', 'title', 'up') if not head.get(k)]
         if missing:
-            return None, p, '素材包头部缺字段：' + ' / '.join(missing)
-        cand, why = find_note_file(raw_dir,
-                                   lq.note_name(head['pubdate'], head['title'], head['up']))
-        return (cand, p, None) if cand else (None, p, why)
-    return None, None, '素材包不存在'
+            return None, packs, '素材包头部缺字段：%s（%s）' % (' / '.join(missing), p.name)
+        cand, w = find_note_file(raw_dir,
+                                 lq.note_name(head['pubdate'], head['title'], head['up']))
+        if cand is None:
+            why = w
+            break
+        if cand not in notes:              # 各页标题相同时指向同一份纪要
+            notes.append(cand)
+    if why:
+        return None, packs, why
+    return notes, packs, None
 
 
 def _last_ts(d, bv, stage=None):
-    """该任务最后一条事件的时刻；给了 stage 就只看该阶段。"""
+    """该任务最后一条事件的时刻；给了 stage 就只看该阶段。
+
+    事件里的任务名要按看板的口径归一（分P 后缀并到裸 BV），否则多 P 任务
+    按裸 BV 查不到任何一条事件，已用时间就一直是空。
+    """
     _run, events = ph._load_raw(d)
     hits = [e['ts'] for e in events
-            if e.get('task') == bv and e.get('ts')
+            if ph._norm_id(e.get('task')) == bv and e.get('ts')
             and (stage is None or e.get('stage') == stage)]
     return max(hits) if hits else None
 
@@ -174,15 +206,17 @@ def reconcile(d=None, raw_dir=None, cache_dir=None, dry=False, only=None,
         if wanted is not None and bv not in wanted:
             continue
         row = {'task': bv, 'title': t.get('title'), 'stage': t['stage']}
-        note, pack, why = note_for(bv, cache, raw)
-        if note is None:
+        notes, packs, why = note_for(bv, cache, raw)
+        if packs:
+            row['pack_files'] = [str(p) for p in packs]
+        if notes is None:
             row['skipped'] = why
             items.append(row)
             continue
-        row['note_file'] = str(note)
-        row['pack_file'] = str(pack)
+        row['note_files'] = [str(n) for n in notes]
         end = _last_ts(run, bv, 'transcribed') or _last_ts(run, bv)
-        row['elapsed'] = round(max(0.0, note.stat().st_mtime - end), 1) if end else None
+        last = max(notes, key=lambda n: n.stat().st_mtime)
+        row['elapsed'] = round(max(0.0, last.stat().st_mtime - end), 1) if end else None
         if not dry:
             row['emitted'] = bool(ph.emit(
                 task=bv, stage='done', pct=100.0, kind='end', elapsed=row['elapsed'],
@@ -190,16 +224,19 @@ def reconcile(d=None, raw_dir=None, cache_dir=None, dry=False, only=None,
                 note='已完成（依纪要文件自动补发）', d=run))
             # 顺带把「待编译」挂上看板：这条只走到纪要，编译是另一件事
             if row['emitted'] and pend:
-                name = note.stem
-                if name in listed:
-                    row['pending'] = '已登记'
-                else:
-                    row['pending'] = bool(register_pending(name, d=run))
-                    listed.add(name)
+                reg = []
+                for n in notes:
+                    name = n.stem
+                    if name in listed:
+                        reg.append(name + '（已登记）')
+                    elif register_pending(name, d=run):
+                        listed.add(name)
+                        reg.append(name)
+                row['pending'] = reg
         items.append(row)
     return {'run_dir': str(run), 'raw_dir': str(raw), 'cache_dir': str(cache),
             'dry_run': dry,
-            'done': sum(1 for r in items if r.get('note_file')),
+            'done': sum(1 for r in items if r.get('note_files')),
             'skipped': sum(1 for r in items if r.get('skipped')), 'items': items}
 
 

@@ -51,7 +51,8 @@
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
-| **[v2.9.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.9.0)** | 2026-10-13 | 命令行查看进度（一条命令打印，不起服务、不开浏览器）· 同一支视频不再在看板上裂成两行 |
+| **[v2.9.1](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.9.1)** | 2026-10-13 | 分P 视频全链路补齐（素材包按页归档与校验、按页配套补发完成信号）· 看板「闪一下就没了」与并发解析修复 |
+| [v2.9.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.9.0) | 2026-10-13 | 命令行查看进度（一条命令打印，不起服务、不开浏览器）· 同一支视频不再在看板上裂成两行 |
 | [v2.8.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.8.0) | 2026-10-02 | 看板批次隔离（一个批次一个运行目录）· 未编译的看得见（新增「待编译」阶段 + 收尾信号自动对账）· 「已耗时」改回任务实测耗时 |
 | [v2.7.2](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.2) | 2026-09-29 | 便携版凭据路径修正（导出的 Cookie 此前读不到）· 条目格式对齐知识库 · 文档精简 280 行 |
 | [v2.7.1](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.1) | 2026-09-28 | 自测在非 UTC+8 的机器上不再误报失败 · 补上 CI（2 构建 × Windows/Linux） |

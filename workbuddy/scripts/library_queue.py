@@ -7,6 +7,10 @@
   python library_queue.py --token <op_token>                 完整处理（补信息 + 转写）
   python library_queue.py --token <op_token> --meta-only     只查重 + 补元信息，不转写
   python library_queue.py --token <op_token> --limit 3       本次最多处理 3 条
+                                                             ⚠️ 截断不是「台账只有 N 条」：
+                                                             剩余行会在 report.skipped_by_limit
+                                                             与 stderr 里报出，需再跑一轮
+                                                             补完；不指定则一次处理全部
   python library_queue.py --token <op_token> --engine funasr-nano --hotwords <文件>
                                                               中文专名密集批次改用 Nano 引擎（不传则 whisper）
   python library_queue.py --token <op_token> --engine funasr-nano --force-asr
@@ -88,8 +92,8 @@ LIB = Path(os.environ.get('BILI_LIBRARY_PLUGIN', str(_pick_lib_dir())))
 DEFAULT_DB = os.environ.get('BILI_DATABASE_ID', '<YOUR_DATABASE_ID>')
 DEFAULT_RAW = Path(os.environ.get('BILI_RAW_DIR', str(Path.home() / 'obsidian' / 'raw')))
 # 素材包（转写全文）不进知识库，落缓存目录，--finish 收尾时归档到 bili_subs
-DEFAULT_CACHE = Path(os.environ.get('BILI_CACHE_DIR', str(
-    Path.home() / '.workbuddy' / 'cache' / 'bili')))
+DEFAULT_CACHE = Path(os.environ.get(
+    'BILI_CACHE_DIR', str(Path.home() / '.workbuddy' / 'cache' / 'bili')))
 
 ST_PENDING = '待处理'
 ST_TRANSCRIBED = '已转写'
@@ -171,10 +175,20 @@ def parse_pack_header(md_path):
 
 
 def pack_candidates(cache_dir, bv, item=None):
-    """素材包可能的位置，按优先级：索引记录的路径 → 缓存目录 → 归档目录。"""
+    """素材包可能的位置，按优先级：索引记录的路径 → 缓存目录 → 归档目录。
+
+    分P 视频的素材包按页分文件（`bili_<BV>_p<页>.md`），没有无后缀那一份。
+    不把分P 纳入候选，`--note-name` 与 `heal_index` 会对分P 视频一律报
+    「素材包不存在」（2026-10-03 实测：ck3 五分P 全部落空）。按页码顺序追加，
+    保证同名时优先取 P1（与单P 的 `bili_<BV>.md` 等价）。
+    """
     cands = [(item or {}).get('transcript', ''),
              str(Path(cache_dir) / f'bili_{bv}.md'),
              str(Path(cache_dir).parent / 'bili_subs' / f'bili_{bv}.md')]
+    base = Path(cache_dir)
+    subs = base.parent / 'bili_subs'
+    cands += [str(base / f'bili_{bv}_p{p}.md') for p in range(1, 10)]
+    cands += [str(subs / f'bili_{bv}_p{p}.md') for p in range(1, 10)]
     return list(dict.fromkeys(c for c in cands if c))
 
 
@@ -203,6 +217,70 @@ def heal_index(cache_dir, bv, idx=None):
             return item, True
         return item, False
     return item, False
+
+
+def archive_packs(cache_dir, archive_dir, bv, item=None):
+    """把某 BV 的全部素材包从 cache 目录搬进归档目录，返回结构化结果。
+
+    返回 {'archived_list': [...], 'errors': [...], 'error': None|str,
+           'details': [...], 'hint': str}
+
+    单独成函数的原因：这段是本脚本最容易写错的地方（分P 曾整体落空、--finish 直接
+    拒绝闭环）。埋在 main() 里时回归测试只能复制一份逻辑来测，测的不是真代码——
+    那样测试全过也证明不了什么。
+
+    分P 视频的素材包按页分文件（`bili_<BV>_p<页>.md`），没有无后缀那一份；本函数
+    按「同一 BV 的所有真实素材包」处理，全部在归档目录里视为已完成，缓存目录里有的
+    逐个搬过去（2026-10-03 实测：旧逻辑只认 `bili_<BV>.md`，ck3 五个分P 一份都没搬）。
+
+    **搬运之前**先核分P 齐全性：按素材包头部「分P：N/M」的总页数核对页号集合。
+    只清点现存文件查不出「尾部缺一份」（P5 丢失只剩 P1–P4，目录里有的那份看起来总是
+    齐的）；先查再搬，才不会在磁盘上留下半套素材包。
+    """
+    archive_dir = Path(archive_dir)
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    errors = []
+    in_cache, in_archiv = [], []
+    for p in pack_candidates(cache_dir, bv, item):
+        fp = Path(p)
+        if not fp.is_file():
+            continue
+        (in_archiv if fp.parent.name == 'bili_subs' else in_cache).append(fp)
+    want_all = sorted(in_cache + in_archiv,
+                      key=lambda x: (0 if re.search(r'_p\d+\.md$', x.name) else 1,
+                                     x.name))
+    if not want_all:
+        return {'archived_list': [], 'errors': [],
+                'error': f'素材包归档失败：{bv}',
+                'details': ['素材包不存在（缓存与归档目录都没有）'],
+                'hint': '请检查 cache/bili 或 bili_subs 下的素材包后重跑 --finish；台账状态未改动'}
+
+    if len(want_all) > 1 and verify_pack is not None \
+            and hasattr(verify_pack, 'check_multip'):
+        mp_errors = verify_pack.check_multip([str(p) for p in want_all])
+        if mp_errors:
+            return {'archived_list': [], 'errors': [],
+                    'error': f'分P 素材包不齐：{bv}', 'details': mp_errors,
+                    'hint': '缺失的分P 需补转写后重跑 --finish；台账状态未改动'}
+
+    archived_list = []
+    for fp in want_all:
+        tgt = archive_dir / fp.name
+        if fp.resolve() == tgt.resolve():
+            archived_list.append(str(tgt))
+            continue
+        try:
+            shutil.move(str(fp), str(tgt))
+            archived_list.append(str(tgt))
+        except Exception as e:
+            errors.append(f'{fp.name}: {e}')
+    if not archived_list:
+        return {'archived_list': [], 'errors': errors,
+                'error': f'素材包归档失败：{bv}',
+                'details': errors or ['未知错误'],
+                'hint': '请检查 cache/bili 或 bili_subs 下的素材包后重跑 --finish；台账状态未改动'}
+    return {'archived_list': archived_list, 'errors': errors,
+            'error': None, 'details': [], 'hint': ''}
 
 
 def lib_api(token, script, args):
@@ -330,7 +408,10 @@ def main():
     ap.add_argument('--raw-dir', default=str(DEFAULT_RAW), help='纪要落盘目录')
     ap.add_argument('--cache-dir', default=str(DEFAULT_CACHE), help='素材包缓存目录')
     ap.add_argument('--meta-only', action='store_true')
-    ap.add_argument('--limit', type=int, default=0)
+    ap.add_argument('--limit', type=int, default=0,
+                    help='本轮最多处理 N 条（0=不限制，一次处理全部）。'
+                         '注意：它只限制本轮处理量，不代表台账只有 N 条待处理——'
+                         '被截断的条数会在 report.skipped_by_limit 与 stderr 中报出，需再跑一轮补完')
     ap.add_argument('--retry-failed', action='store_true',
                     help='把状态为「失败」的行也纳入本次处理；默认跳过（失败行不会被重复处理）')
     ap.add_argument('--up', help='只处理指定 UP主（按 UP主 列精确匹配）')
@@ -403,35 +484,31 @@ def main():
         idx = load_index(cache_dir)
         # 索引缺行或字段不全 → 从素材包反解补齐后再归档（素材包是事实源）
         item, healed = heal_index(cache_dir, want, idx)
-        dst = archive_dir / f'bili_{want}.md'
-        errs = []
-        archived = None
-        if dst.is_file():
-            # 已在归档目录（历史批次或此前已归档）
-            archived = str(dst)
-        else:
-            for p in dict.fromkeys([item.get('transcript', ''), str(cache_dir / f'bili_{want}.md')]):
-                if not p:
-                    continue
-                fp = Path(p)
-                if not fp.is_file():
-                    continue
-                if fp.resolve() == dst.resolve():
-                    archived = str(dst)
-                    break
-                try:
-                    shutil.move(str(fp), str(dst))
-                    archived = str(dst)
-                    break
-                except Exception as e:
-                    errs.append(f'{fp.name}: {e}')
-            if archived is None and not errs:
-                errs.append('素材包不存在（缓存与归档目录都没有）')
+
+        # 搬运单独成函数：归档是本脚本里最容易写错的一段（分P 曾整体落空），
+        # 埋在 main() 里时回归测试只能复制一份逻辑来测，测的不是真代码。
+        res = archive_packs(cache_dir, archive_dir, want, item)
+        errs = list(res['errors'])
+        archived_list = res['archived_list']
+        if res['error']:
+            print(json.dumps({'error': res['error'],
+                              'archive_errors': res['details'] or errs,
+                              'hint': res['hint']},
+                             ensure_ascii=False, indent=2))
+            return
+
+        archived = archived_list[0] if archived_list else None
+        # 台账「素材包」列只放第一份；分P 的其余路径追加在后面，避免下游取路径时被截断
+        archived_field = archived
+        if len(archived_list) > 1:
+            archived_field = archived + '（分P 其余：' + \
+                '；'.join(p for p in archived_list[1:]) + '）'
 
         if archived is None:
-            # 归档失败：不动台账，保留原状态，等人工处理后重跑 --finish
+            # 兜底：archive_packs 已在 archived_list 为空时返回 error，走不到这里。
+            # 保留是防止以后有人改函数时把台账写成「已完成」却没归档素材包。
             print(json.dumps({'error': f'素材包归档失败：{want}',
-                              'archive_errors': errs,
+                              'archive_errors': errs or ['未搬动任何素材包'],
                               'hint': '请检查 cache/bili 或 bili_subs 下的素材包后重跑 --finish；台账状态未改动'},
                              ensure_ascii=False, indent=2))
             return
@@ -440,12 +517,19 @@ def main():
         vp_warnings = []
         pack_check = "ok"
         if verify_pack is not None:
-            vp_errors, vp_warnings, _vp = verify_pack.check_pack(archived)
-            if vp_errors:
-                print(json.dumps({'error': f'素材包校验未通过：{want}',
-                                  'pack_errors': vp_errors,
-                                  'hint': '请修复素材包后重跑 --finish；台账状态未改动'},
-                                 ensure_ascii=False, indent=2))
+            # 分P 的每一份都要过校验：只查第一份等于放过后四份残缺素材包
+            vp_failed = False
+            for pk in (archived_list or [archived]):
+                vp_errors, vp_warnings, _vp = verify_pack.check_pack(pk)
+                if vp_errors:
+                    vp_failed = True
+                    print(json.dumps({'error': f'素材包校验未通过：{want}',
+                                      'pack': pk,
+                                      'pack_errors': vp_errors,
+                                      'hint': '请修复素材包后重跑 --finish；台账状态未改动'},
+                                     ensure_ascii=False, indent=2))
+                    break
+            if vp_failed:
                 return
         else:
             # 降级必须显式可见：静默跳过校验等于让「归档前拦截」失效（2026-09-16 审查 P0-3）
@@ -454,7 +538,7 @@ def main():
                   file=sys.stderr)
 
         props = {'状态': {'select': ST_DONE}, '处理时间': {'date': today},
-                 '素材包': {'text': archived}}
+                 '素材包': {'text': archived_field}}
         if a.summary:
             props['纪要'] = {'text': a.summary}
         if a.ima:
@@ -500,16 +584,30 @@ def main():
             continue
         targets.append((rid, link, st))
 
+    # 截断必须在输出里留下痕迹。--limit 的语义是「本轮最多处理 N 条」，不是「台账只有 N 条」，
+    # 但截断后 pending 会被改写成截断值，调用方看到「待处理 1 条」会误判台账只有 1 条，
+    # 从而漏掉其余行（2026-10-05 实测：台账两条待处理，--limit 1 只处理一条，输出无任何提示）。
+    # 因此先记下截断前的真实条数，并在 report 与 stderr 双处显式报出剩余量。
+    total_pending = len(targets)
     if a.limit:
         targets = targets[:a.limit]
 
     report = {'total': len(results), 'pending': len(targets),
+              # 截断前台账里真实的待处理条数；未截断时与 pending 相等
+              'total_pending': total_pending,
+              # 被 --limit 挡下、本轮未处理的行数。> 0 时调用方必须再跑一轮
+              'skipped_by_limit': total_pending - len(targets),
               'duplicates': [], 'processed': [], 'failed': []}
 
     if not targets:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return
 
+    if report['skipped_by_limit']:
+        print(f"⚠️ 待处理 {total_pending} 条，本次因 --limit {a.limit} 只处理 "
+              f"{len(targets)} 条，**尚有 {report['skipped_by_limit']} 条未处理，"
+              f"需再跑一轮**（或去掉 --limit 一次跑完）",
+              file=sys.stderr)
     print(f'待处理 {len(targets)} 条，转写={"关" if a.meta_only else "开"}\n', file=sys.stderr)
 
     probe = Path(tempfile.gettempdir()) / f'_bili_probe_{os.getpid()}.md'

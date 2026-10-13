@@ -164,6 +164,56 @@ def check_pack(path):
     return errors, warnings, info
 
 
+PART_RE = re.compile(r'分P[：:]\s*(\d+)\s*/\s*(\d+)')
+PART_FILE_RE = re.compile(r'_p(\d+)\.md$')
+
+
+def parse_part_marker(path):
+    """读素材包头部的「分P：3/5」，返回 (本页, 总页数)；单 P 或没有该标记时返回 None。
+
+    这条分母是「应有几份」的权威依据：只按文件名清点现存素材包时，
+    尾部缺一份（P5 丢失只剩 P1–P4）查不出来——目录里有的那份看起来总是齐的。
+    """
+    try:
+        t = Path(path).read_text(encoding='utf-8', errors='replace')
+    except Exception:
+        return None
+    m = PART_RE.search(t)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def check_multip(paths):
+    """校验同一 BV 的分P 素材包是否齐全。返回 errors 列表（空 = 齐全）。
+
+    判据：取头部声明的总页数 M，要求实际页号集合等于 {1..M}。
+    缺中间页（P1、P2、P4）和缺尾页（P5 丢失）都能查出。
+    """
+    paths = [Path(p) for p in paths]
+    if not paths:
+        return []
+    markers = [(p, parse_part_marker(p)) for p in paths]
+    markers = [(p, m) for p, m in markers if m]
+    if not markers:
+        return []
+    total = max(m[1] for _, m in markers)
+    seen = {m[0] for _, m in markers}
+    # 文件名页号与头部页号互证（防止归档时页号错位）
+    name_mismatch = []
+    for p, (cur, _) in markers:
+        mf = PART_FILE_RE.search(p.name)
+        if mf and int(mf.group(1)) != cur:
+            name_mismatch.append(f'{p.name} 头部标 P{cur}，文件名却是 P{mf.group(1)}')
+    missing = sorted(set(range(1, total + 1)) - seen)
+    errors = []
+    if missing:
+        errors.append('分P 素材包不全：头部声明共 %d 页，缺 P%s'
+                      % (total, '、P'.join(str(x) for x in missing)))
+    errors += name_mismatch
+    return errors
+
+
 def main():
     argv = sys.argv[1:]
     strict = '--strict' in argv
