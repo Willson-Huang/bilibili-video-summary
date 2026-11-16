@@ -10,7 +10,7 @@
   2. 转写段落合并
   3. 广告标记（含"撞车词"回归：夸克 vs 夸克App）
   4. 时长解析（mm:ss 与 h:mm:ss）
-  5. 进度看板折叠（终态冻结、阶段不回退、加权总进度）
+  5. 进度折叠（终态冻结、阶段不回退、加权总进度）
 """
 import json
 import os
@@ -138,7 +138,7 @@ def test_mark_ads():
 
 
 def test_progress_hub():
-    """进度看板折叠逻辑：终态冻结、阶段不回退、插值与任务 ID 提取。"""
+    """进度折叠逻辑：终态冻结、阶段不回退、插值与任务 ID 提取。"""
     import shutil
     d = Path(tempfile.mkdtemp(prefix='ph_test_'))
     try:
@@ -231,7 +231,7 @@ def test_progress_hub():
               {x['id']: x for x in snap2['tasks']}['BVa']['stage'] == 'done')
         check('consumed.json 已落盘', (d / 'consumed.json').is_file())
 
-        # 两个 skill 共用一个看板：init_run 必须是并入而非替换
+        # 两个 skill 共用一个进度：init_run 必须是并入而非替换
         ph.init_run([{'id': 'BVa', 'title': 'A2', 'duration_sec': 2000}], d=d)
         ids = {x['id'] for x in ph.snapshot(d)['tasks']}
         check('init_run 并入不冲掉他人任务', {'BVa', 'BVb', 'BVc'} <= ids, f'{ids}')
@@ -244,16 +244,6 @@ def test_progress_hub():
         check('任务组进入 rows', rows2['BVd']['group'] == 'wiki编译')
         gs = {g['name']: g for g in ph.snapshot(d)['groups']}
         check('任务组汇总正确', gs.get('wiki编译', {}).get('total') == 1, f'{gs}')
-
-        # 运行模式开关
-        check('mode 默认 auto', ph.progress_mode(None) in ('auto',),
-              ph.progress_mode(None))
-        check('mode=off 被识别', ph.progress_mode('off') == 'off')
-        check('非法 mode 回落 auto', ph.progress_mode('banana') == 'auto')
-        check('off 模式不拉起服务',
-              ph.ensure_serving(d, port=59999, mode='off') is None)
-        check('manual 模式不拉起服务',
-              ph.ensure_serving(d, port=59999, mode='manual') is None)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -545,13 +535,13 @@ def test_notes_done():
         check('耗时取自纪要文件时间与转写结束之差',
               row.get('elapsed') is not None and row['elapsed'] >= 0, f'-> {row.get("elapsed")}')
 
-        # 顺带把「待编译」挂上看板：转写侧的完成只到纪要，编译是另一件事
+        # 顺带把「待编译」挂上进度：转写侧的完成只到纪要，编译是另一件事
         check('补发时顺带登记了待编译',
               row.get('pending') == ['2026-09-02_会议纪要“上”：测试_某某UP_纪要'],
               f'-> {row.get("pending")}')
         fresh(run)
         comp = [t for t in ph.snapshot(run)['tasks'] if t.get('stage') == 'pending']
-        check('待编译条目进了看板', len(comp) == 1, f'-> {len(comp)} 条')
+        check('待编译条目进了进度', len(comp) == 1, f'-> {len(comp)} 条')
         check('待编译条目落在编译组、名字是纪要文件名',
               bool(comp) and comp[0].get('group') == 'wiki编译'
               and comp[0]['id'].endswith('_某某UP_纪要'),
@@ -617,7 +607,7 @@ def test_notes_done():
         check('关闭开关时不登记待编译',
               'pending' not in got6['items'][0], f'-> {got6["items"]}')
 
-        # 7 号：多 P 视频的素材包按页分文件，看板上只有一行 → 每页都要配上纪要才算完
+        # 7 号：多 P 视频的素材包按页分文件，进度上只有一行 → 每页都要配上纪要才算完
         bv7 = 'BV1DONETEST7'
         for page, ptitle in ((1, '多P视频 P1'), (2, '多P视频 P2')):
             (arch / f'bili_{bv7}_p{page}.md').write_text(
@@ -669,7 +659,7 @@ def test_batch_rotate():
     """批次隔离：一个批次一个运行目录（2026-10-02）。
 
     回归：所有批次曾共用一个 run.json，`created` 被首个写入者锁住，任务越滚越多
-    —— 看板的「已耗时」因此量成了目录年龄（415 小时）。
+    —— 进度的「已耗时」因此量成了目录年龄（415 小时）。
     """
     import shutil
     tmp = Path(tempfile.mkdtemp(prefix='bili_batch_test_'))
@@ -685,15 +675,12 @@ def test_batch_rotate():
         ph.init_run([{'id': 'BV1BATCH0001', 'title': '甲'}], title='第一批',
                     d=cur, group='B站转写')
         ph.emit(task='BV1BATCH0001', stage='asr', pct=50.0, d=cur)
-        (cur / 'hub.json').write_text('{"port":8765}', encoding='utf-8')
         dst = ph.rotate_batch(cur, group='B站转写')
         check('轮转返回归档目录', dst is not None and dst.is_dir(), f'-> {dst}')
         check('归档目录名带上来源', dst.name.endswith('-B站转写'), dst.name)
         check('清单与事件都随批次搬走',
               (dst / 'run.json').is_file() and any(dst.glob('events_*.jsonl')),
               f'-> {sorted(p.name for p in dst.iterdir())}')
-        check('hub.json 留在原地（服务状态不算批次数据）',
-              (cur / 'hub.json').is_file() and not (dst / 'hub.json').exists())
         check('当前目录里已无清单', not (cur / 'run.json').exists())
 
         # 目录已空，再轮转不该产生第二个批次
@@ -724,13 +711,6 @@ def test_batch_rotate():
               len(list((tmp / 'progress' / 'batches').iterdir())) == 2)
         rest = json.loads((cur / 'run.json').read_text(encoding='utf-8'))['tasks']
         check('追加后两份任务并存', len(rest) == 2, f'-> {[t["id"] for t in rest]}')
-
-        # 批次名解析：只有 batches 下的直接子目录能被选中
-        good = ph.list_batches(cur)[0]['name']
-        check('合法批次名解析到该目录', ph.resolve_view_dir(good, cur).name == good)
-        for bad in ('../../secret', '../secret', 'a/b', '', None, 'current', '不存在'):
-            check('非法批次名回退当前批：%r' % bad,
-                  ph.resolve_view_dir(bad, cur) == ph.run_dir(cur))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1058,6 +1038,18 @@ def test_status_output():
         check('status 已完成行显示实测耗时', '3分17秒' in out, out)
         check('status 多组时打组汇总', '组 wiki编译' in out, out)
         check('status 长标题按宽度截断', '…' in out)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ph.print_json(d)
+        doc = json.loads(buf.getvalue())
+        check('json 输出可解析', isinstance(doc, dict), f'-> {type(doc).__name__}')
+        check('json 含 run/overall/groups/tasks',
+              {'run', 'overall', 'groups', 'tasks'} <= set(doc), f'-> {sorted(doc)}')
+        check('json 与文本口径一致', doc['overall']['total'] == 3,
+              f'-> {doc["overall"]["total"]}')
+        check('json 里任务节点字段完整',
+              all({'id', 'stage', 'pct'} <= set(t) for t in doc['tasks']),
+              f'-> {sorted(doc["tasks"][0])}')
         check('_fmt_sec 无值给 -', ph._fmt_sec(None) == '-')
         check('_fmt_sec 零值给 0秒', ph._fmt_sec(0) == '0秒')
         check('_clip 按全角宽度截断', len(ph._clip('中' * 40)) < 40, ph._clip('中' * 40))
@@ -1073,13 +1065,40 @@ def test_status_output():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_group_tokens_numbers():
+    """Nano token 聚合：数字之间不补空格，英文之间仍补空格"""
+    import funasr_adapter as fa
+    toks = [
+        {'token': '合并', 'start_time': 0.0, 'end_time': 0.2},
+        {'token': '19', 'start_time': 0.2, 'end_time': 0.3},
+        {'token': '54', 'start_time': 0.3, 'end_time': 0.4},
+        {'token': '年', 'start_time': 0.4, 'end_time': 0.5},
+        {'token': '设', 'start_time': 0.5, 'end_time': 0.6},
+        {'token': '11', 'start_time': 0.6, 'end_time': 0.7},
+        {'token': '37', 'start_time': 0.7, 'end_time': 0.8},
+        {'token': '座', 'start_time': 0.8, 'end_time': 0.9},
+    ]
+    text = ''.join(b['text'] for b in fa.group_tokens({'timestamps': toks}))
+    check('年份不被拆成空格', '1954年' in text, text)
+    check('千位串不被拆成空格', '1137座' in text, text)
+
+    eng = [
+        {'token': 'no', 'start_time': 0.0, 'end_time': 0.2},
+        {'token': 'stranger', 'start_time': 0.2, 'end_time': 0.4},
+        {'token': 'to', 'start_time': 0.4, 'end_time': 0.5},
+        {'token': 'love', 'start_time': 0.5, 'end_time': 0.6},
+    ]
+    text2 = ''.join(b['text'] for b in fa.group_tokens({'timestamps': eng}))
+    check('英文 token 之间仍补空格', text2 == 'no stranger to love', text2)
+
+
 def main():
     print('=== bilibili-video-summary 自测 ===')
     for fn in (test_resolve_input, test_merge_segments, test_strip_prompt_leak,
                test_mark_ads, test_pack_sections, test_pack_pipeline, test_index_heal,
                test_verify_pack, test_finish_guards, test_dedup_skip, test_progress_hub,
                test_status_output, test_parse_duration, test_notes_done,
-               test_batch_rotate, test_audit_fixes):
+               test_batch_rotate, test_audit_fixes, test_group_tokens_numbers):
         if lq is None and fn.__name__ in NEED_LQ:
             print(f'-- {fn.__name__}  [跳过：本副本无 library_queue.py（便携版）]')
             continue

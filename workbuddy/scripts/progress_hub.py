@@ -1,26 +1,24 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-任务进度看板（stdlib only，零第三方依赖）
+任务进度（stdlib only，零第三方依赖）
 
 设计要点
 --------
 写入端：管线任意进程调用 emit()，把自己进程的进度事件追加到
         <run_dir>/events_<pid>.jsonl。**每进程独立文件**，不抢锁、不会交错损坏，
         进程崩了也只丢自己那一份。
-读取端：--status 打印纯文本进度（默认，日常查看用）；--serve 起一个 HTTP 服务，
-        聚合 run.json + 未退役的 events_*.jsonl + state_snapshot.json，
-        输出 /api/state 给 dashboard.html 轮询（大批量任务时持续盯进度用）。
+读取端：--status 打印纯文本进度，聚合 run.json + 未退役的 events_*.jsonl
+        + state_snapshot.json。
 
 为什么不用现成方案：GitHub 上的进度项目（tqdm / rich / enlighten / textual）
-都是"终端里的进度条"，成不了独立窗口；引入 textual 还要在有依赖冲突风险的
-venv 里装包。本方案零依赖、样式自由，且能同时承载转写与纪要两类任务。
+都要往有依赖冲突风险的 venv 里装包。本方案零依赖，且能同时承载转写与纪要
+两类任务。
 
 用法
 ----
   python progress_hub.py --status                # 打印当前批次进度（纯文本）
   python progress_hub.py --init --tasks tasks.json --title "批次二"
-  python progress_hub.py --serve --port 8765 --open
   python progress_hub.py --emit --task BV1xxx --stage asr --pct 42.5
   python progress_hub.py --emit --task BV1xxx --stage notes --note 生成纪要中
   python progress_hub.py --emit --task BV1xxx --stage done --elapsed 812.4
@@ -38,7 +36,6 @@ import sys
 import threading
 import time
 import unicodedata
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -54,13 +51,13 @@ STAGE_LABEL = {
 }
 # 阶段序：只允许向前推进，迟到的旧阶段事件不会把显示拉回去。
 # done 与 fail 同阶。转写脚本只发到 transcribed，「已完成」由写完纪要的一方发出 ——
-# 若让转写脚本直接发 done，终态锁会把后到的 notes 吞掉，看板会提前宣布完成。
+# 若让转写脚本直接发 done，终态锁会把后到的 notes 吞掉，进度会提前宣布完成。
 STAGE_RANK = {'queued': 0, 'download': 1, 'convert': 2, 'asr': 3,
               'transcribed': 4, 'notes': 5, 'pending': 6, 'done': 8, 'fail': 8}
 TERMINAL = ('done', 'fail')
 # 进行中阶段：这些阶段的「已用时间」可以从事件时刻外推
 ACTIVE_STAGES = ('download', 'convert', 'asr', 'notes')
-# 停更超过该秒数就不再外推时间（前端用同一个值，见 dashboard.html 的 STALE_CAP）
+# 停更超过该秒数就不再外推时间
 STALE_CAP_SEC = 5.0
 # 转写倍率常量：按单条标定（见 references/perf-benchmark-2026-09-13.md）。
 # 批量实测只有约 2.1x，照常量推算会把「预计剩余」压到 0，故仅在样本不足时兜底。
@@ -76,7 +73,7 @@ BATCH_AUDIO_MIN = 2
 # 影响，波动比逐条迭代的任务大，需要更平滑时可下调到 0.2。
 RTF_EMA_ALPHA = 0.3
 # 各阶段的预期心跳间隔（秒）：该阶段内这么久没有事件属于正常。
-# 过期阈值由它推出（转黄 = 心跳，转红 = 3 倍心跳）并随状态下发给前端。
+# 过期阈值由它推出（提醒 = 心跳，告警 = 3 倍心跳）。
 # 「生成纪要」由主 agent 在写完时上报一次，中间几分钟没有事件是正常的，
 # 沿用单一阈值会让它一直被标成过期。
 STAGE_HEARTBEAT = {
@@ -86,13 +83,13 @@ STAGE_HEARTBEAT = {
     'pending': 86400,
     'done': 3600, 'fail': 3600,
 }
-# 兜底阈值（秒）：阶段不在上表里时使用，前端也保留同一组兜底值
+# 兜底阈值（秒）：阶段不在上表里时使用
 STALE_WARN_SEC = 10
 STALE_BAD_SEC = 30
 
 
 def stale_thresholds(stage):
-    """按阶段给出 (转黄秒数, 转红秒数)；阶段未知时用兜底值。"""
+    """按阶段给出 (提醒秒数, 告警秒数)；阶段未知时用兜底值。"""
     hb = STAGE_HEARTBEAT.get(stage)
     if not hb:
         return STALE_WARN_SEC, STALE_BAD_SEC
@@ -107,11 +104,6 @@ KINDS = ('begin', 'report', 'end')
 # 退役文件在「无人写入」超过该秒数后才允许删除（避免删掉仍持有句柄的活文件）
 COMPACT_SAFE_AGE = 300
 
-# 看板端口：一次探测只认「hub.json 里记录的实际端口」，不做端口段扫描
-DEFAULT_PORT = 8765
-# 服务启动时把实际端口写这里，供 ensure_serving 一次探测就定位（避免端口扫描）
-HUB_STATE = 'hub.json'
-
 
 # --------------------------------------------------------------------------- #
 # 路径与标识
@@ -125,7 +117,7 @@ def run_dir(d=None):
 # --------------------------------------------------------------------------- #
 # 批次隔离（2026-10-02）
 #
-# 运行目录名固定是 current，所有脚本都往它写、看板也读它 —— 这样两边都不必知道
+# 运行目录名固定是 current，所有脚本都往它写、读取也读它 —— 这样两边都不必知道
 # 批次的存在。隔离发生在「开新批」那一步：把 current 整份搬进
 # `batches/<时间>-<来源>/`，再重建一个空的 current。新批次因此看不到旧批次的任务，
 # 历史又按目录原样留了下来。
@@ -133,8 +125,6 @@ def run_dir(d=None):
 # 曾经显示成 415 小时（目录年龄），任务量也越滚越多。
 # --------------------------------------------------------------------------- #
 BATCHES_SUBDIR = 'batches'
-# 轮转时留在原地不搬：这些属于「服务状态」，不算「批次数据」
-ROTATE_KEEP = ('hub.json',)
 _INVALID_NAME_CHARS = None
 
 
@@ -155,7 +145,7 @@ def batch_name(group=None):
 
 
 def _has_batch_data(d):
-    """目录里有没有值得归档的东西 —— 只看 run.json 与事件，不看 hub.json。"""
+    """目录里有没有值得归档的东西 —— 只看 run.json 与事件。"""
     return (d / 'run.json').is_file() or next(d.glob('events_*.jsonl'), None) is not None
 
 
@@ -178,19 +168,17 @@ def rotate_batch(d=None, group=None):
         n += 1
     dst.mkdir(parents=True, exist_ok=True)
     for f in sorted(d.iterdir()):
-        if f.name in ROTATE_KEEP:
-            continue
         try:
             shutil.move(str(f), str(dst / f.name))
         except OSError:
-            pass                             # 被占用（看板正在读）不该让开批失败
+            pass                             # 被占用（有进程正在读）不该让开批失败
     with _RAW_LOCK:
         _RAW_CACHE.pop(str(d), None)
     return dst
 
 
 def list_batches(d=None):
-    """已归档的批次，新的在前。带条目数与完成数，供看板的批次选择器直接用。"""
+    """已归档的批次，新的在前。带条目数与完成数，供 --list-batches 用。"""
     root = batches_root(d)
     if not root.is_dir():
         return []
@@ -215,38 +203,6 @@ def list_batches(d=None):
     return out
 
 
-def resolve_view_dir(name=None, d=None):
-    """把批次名解析成目录；名字不合法就回退到当前批。
-
-    名字只接受 batches/ 下的**直接子目录**（用 parent 比对挡掉 `..` 与带分隔符的写法），
-    避免看板变成任意路径的读取器。
-    """
-    base = run_dir(d)
-    if not name or name in ('current', '.'):
-        return base
-    root = batches_root(base)
-    cand = root / str(name)
-    try:
-        if cand.is_dir() and cand.parent.resolve() == root.resolve():
-            return cand
-    except OSError:
-        pass
-    return base
-
-
-def batch_overview(d=None):
-    """当前批 + 已归档批次，供看板的批次选择器使用。"""
-    base = run_dir(d)
-    snap = snapshot(base)
-    return {
-        'current': {'name': 'current', 'title': snap['run'].get('title'),
-                    'created': snap['run'].get('created'),
-                    'total': snap['overall']['total'],
-                    'done': snap['overall']['done']},
-        'batches': list_batches(base),
-    }
-
-
 _BV_RE = None
 _FV_RE = None
 
@@ -256,7 +212,7 @@ def task_of(path):
 
     文本里出现 BV 号时一律只取那 10 位：素材包取 `out`、音频取 `out` 的同级音轨，
     文件名带 `_p<N>` 分P 后缀（`BV1XeH66oEre_p1.m4a`）。分P 是同一支视频的不同分段，
-    看板上合成一行，所以前缀必须归并，不然同一支视频会裂成两行。
+    进度里合成一行，所以前缀必须归并，不然同一支视频会裂成两行。
     """
     global _BV_RE
     global _FV_RE
@@ -426,7 +382,7 @@ def observed_rtf(d=None, min_samples=RTF_MIN_SAMPLES):
 def load_rtf_history(d=None, engine=None):
     """读跨批次的历史倍率样本（只读，失败返回空表）。
 
-    历史**不参与计算**，只用于在顶部把「本批实测」与「历史中位」并排显示，
+    历史**不参与计算**，只作参照：把「本批实测」与「历史中位」并排给人看，
     让人自己判断本批是否异常（换机器 / 换模型版本 / GPU 被占用）。
     与 Airflow 的 Task Duration 视图同一个思路：给参照，不做自动采用。
     """
@@ -506,7 +462,7 @@ def effective_rtf(d=None, engine='funasr-nano'):
     """当前该用的转写倍率，返回 (倍率, 来源)。
 
     来源三档，越靠前越可信：observed（本批实测）→ batch（批量兜底）→ constant（单条常量）。
-    前端会把来源显示出来 —— 让人知道这个「预计剩余」是按什么算的。
+    来源一并返回 —— 让人知道这个「预计剩余」是按什么算的。
     """
     obs = observed_rtf(d)
     if obs:
@@ -611,10 +567,7 @@ def _read_jsonl(p):
 def _load_raw(d):
     """返回 (run, events)。命中签名缓存则直接复用已解析的事件。
 
-    解析在锁内完成（2026-10-03 修）：原先是「锁内查缓存 → 锁外读文件解析 → 锁内写回」，
-    两个请求同时未命中时会把同一批事件重复解析两遍。ThreadingHTTPServer
-    每个请求一个线程，轮询 + 批次列表 + 首屏请求会并发触发它，
-    任务量大时表现为 CPU 抖动与响应时间忽长忽短。
+    解析在锁内完成：多个读者同时未命中时，不会把同一批事件重复解析两遍。
     """
     key = str(d)
     with _RAW_LOCK:
@@ -658,12 +611,12 @@ def _load_raw(d):
 
 
 # --------------------------------------------------------------------------- #
-# 读取端：折叠成看板状态
+# 读取端：折叠成进度状态
 # --------------------------------------------------------------------------- #
 def _norm_id(tid):
     """把「BV 号＋分P 后缀」的任务 id 归并成裸 BV 号。
 
-    上游把音轨名整串当成任务 id 传进来时会落到这里：看板上一行＝一支视频，
+    上游把音轨名整串当成任务 id 传进来时会落到这里：一行＝一支视频，
     这类 id 不归并就会给同一支视频单开一行（无标题，显示成裸编号）。
     其他形态的 id（纪要名、wiki 条目名）原样返回。
     """
@@ -731,7 +684,7 @@ def _fold_tasks(run, events):
 
 
 def snapshot(d=None):
-    """把 run.json + 事件折叠成看板要的状态。"""
+    """把 run.json + 事件折叠成进度状态。"""
     d = run_dir(d)
     run, events = _load_raw(d)
     tasks, order = _fold_tasks(run, events)
@@ -750,7 +703,7 @@ def snapshot(d=None):
         if ts > newest:
             newest, cur_stage = ts, (t.get('stage') or 'queued')
     stale_warn, stale_bad = stale_thresholds(cur_stage)
-    # 倍率：本批实测优先 → 批量兜底 → 单条常量（来源一并报给前端）
+    # 倍率：本批实测优先 → 批量兜底 → 单条常量（来源一并给出）
     rate, rate_src = effective_rtf(d, run.get('engine') or 'funasr-nano')
     rows = []
     for tid in order:
@@ -807,7 +760,7 @@ def snapshot(d=None):
             'eta': round(eta, 1) if eta is not None else None,
             'overrun': bool(overrun),
             # 转写中的实测速率（音频秒数 ÷ 已用秒数）：只有这一阶段能算出来。
-            # 前端用它解释「这个预计剩余是按什么速度推的」；算不出来就不给。
+            # 用它解释「这个预计剩余是按什么速度推的」；算不出来就不给。
             'rate': (round(float(dur) / float(elapsed), 2)
                      if st == 'asr' and dur and elapsed and elapsed > 0 else None),
             'kind': t.get('last_kind'),
@@ -836,7 +789,7 @@ def snapshot(d=None):
             'note': e.get('note') or (e.get('title') or ''), 'src': e.get('src')}
            for e in events if e.get('note') or e.get('stage')][-14:]
 
-    # 任务组汇总：两个 skill 共用一个看板时，用组区分"谁的任务"
+    # 任务组汇总：两个 skill 共用一个运行目录时，用组区分"谁的任务"
     groups = {}
     for r in rows:
         g = r.get('group') or '未分组'
@@ -859,7 +812,7 @@ def snapshot(d=None):
         'overall': {
             'pct': round(overall, 2), 'total': total, 'done': done, 'failed': failed,
             'active': len(active), 'eta': round(remaining, 1) if total else None,
-            # eta_complete=False：还有任务没有可用的时间依据，前端应标注为「≥」
+            # eta_complete=False：还有任务没有可用的时间依据，剩余时间只能报下限
             'eta_complete': all(r['eta'] is not None for r in open_rows),
             'overrun': any(r['overrun'] for r in open_rows),
             'rate': rate,
@@ -869,7 +822,7 @@ def snapshot(d=None):
             'rate_history': load_rtf_history(d, run.get('engine')),
             'updated': data_ts or now,      # 数据时刻：最后一条事件的时刻
             'stale_sec': round(stale_sec, 1),
-            # 阈值随状态下发：前端不再各写一份，改一处即生效；取值随阶段变化
+            # 阈值集中在这一处，取值随阶段变化
             'stale_warn': stale_warn,
             'stale_bad': stale_bad,
             'stale_cap': STALE_CAP_SEC,
@@ -913,7 +866,7 @@ def _clip(text, limit=34):
 
 
 def print_status(d=None):
-    """纯文本进度输出：读同一份快照，不起服务、不开浏览器。"""
+    """纯文本进度输出：读同一份快照。"""
     snap = snapshot(d)
     run, ov = snap['run'], snap['overall']
     stale = ov.get('stale_sec') or 0.0
@@ -947,6 +900,11 @@ def print_status(d=None):
         print('')
         for g in snap['groups']:
             print('  组 %-12s %.1f%%  %d/%d' % (g['name'], g['pct'], g['done'], g['total']))
+
+
+def print_json(d=None):
+    """JSON 进度输出：同一份快照，供脚本与外部程序消费。"""
+    print(json.dumps(snapshot(d), ensure_ascii=False, indent=2))
 
 
 # --------------------------------------------------------------------------- #
@@ -997,363 +955,10 @@ def compact(d=None, safe_age=COMPACT_SAFE_AGE, dry=False):
 
 
 # --------------------------------------------------------------------------- #
-# HTTP
-# --------------------------------------------------------------------------- #
-class Handler(BaseHTTPRequestHandler):
-    server_version = 'ProgressHub/2.0'
-
-    def log_message(self, *a):  # 静音
-        pass
-
-    def _send(self, code, body, ctype='application/json; charset=utf-8'):
-        if isinstance(body, str):
-            body = body.encode('utf-8')
-        try:
-            self.send_response(code)
-            self.send_header('Content-Type', ctype)
-            self.send_header('Content-Length', str(len(body)))
-            self.send_header('Cache-Control', 'no-store')
-            self.end_headers()
-            if body:
-                self.wfile.write(body)
-        except Exception:
-            pass
-
-    def do_GET(self):
-        from urllib.parse import urlsplit, parse_qs
-        parts = urlsplit(self.path)
-        path = parts.path
-        # ?batch=<名字> 切到某个已归档批次；名字非法时 resolve_view_dir 会回退到当前批
-        batch = (parse_qs(parts.query).get('batch') or [None])[0]
-        if path in ('/', '/index.html', '/dashboard'):
-            f = HERE / 'dashboard.html'
-            if not f.is_file():
-                return self._send(500, '{"error":"dashboard.html 缺失"}')
-            return self._send(200, f.read_bytes(), 'text/html; charset=utf-8')
-        if path == '/api/state':
-            return self._send(200, json.dumps(
-                snapshot(resolve_view_dir(batch, self.server.run_dir)),
-                ensure_ascii=False))
-        if path == '/api/batches':
-            return self._send(200, json.dumps(
-                batch_overview(self.server.run_dir), ensure_ascii=False))
-        if path == '/api/health':
-            return self._send(200, '{"ok":true}')
-        if path == '/favicon.ico':
-            return self._send(204, b'')   # 静音，别往日志里灌 404
-        return self._send(404, '{"error":"not found"}')
-
-    def do_POST(self):
-        if self.path.split('?')[0] != '/api/emit':
-            return self._send(404, '{"error":"not found"}')
-        try:
-            n = int(self.headers.get('Content-Length') or 0)
-            doc = json.loads(self.rfile.read(n).decode('utf-8') or '{}')
-        except Exception as e:
-            return self._send(400, json.dumps({'error': str(e)}))
-        ok = emit(d=self.server.run_dir, **doc)
-        return self._send(200, json.dumps({'ok': bool(ok)}))
-
-
-# --------------------------------------------------------------------------- #
-# 自启与单实例
-# 关键：**绝不能每跑一条任务就弹一个窗**。所以先探端口，已在跑就只上报、不再拉起。
-# --------------------------------------------------------------------------- #
-def _probe(host, port, timeout=0.3):
-    """该端口上是否已有本看板在跑（认 /api/health 里的 ok:true）。
-
-    两处必须注意（都踩过）：
-    1. **不能用 urllib**：它读系统代理设置，探测 127.0.0.1 时请求可能被代理劫持，
-       关闭端口要等满超时才返回，而且服务真在跑时也会误判为"没跑"。
-    2. **不能只 recv 一次**：TCP 会把响应头与 body 拆成两个段，单次 recv 可能只拿到
-       头（实测三次里两次如此），于是 "ok" 检查落空 -> 误判没在跑 -> 重复拉起窗口。
-       必须累积读到出现 "ok" 或超时为止。
-    """
-    import socket
-    try:
-        with socket.create_connection((host, port), timeout=timeout) as s:
-            s.settimeout(timeout)
-            s.sendall(b'GET /api/health HTTP/1.0\r\nHost: %s:%d\r\n\r\n'
-                      % (host.encode(), port))
-            buf = b''
-            try:
-                while b'"ok"' not in buf and len(buf) < 4096:
-                    chunk = s.recv(512)
-                    if not chunk:
-                        break
-                    buf += chunk
-            except Exception:
-                pass
-        return b'"ok"' in buf and b'true' in buf
-    except Exception:
-        return False
-
-
-def _pid_alive(pid):
-    """pid 是否仍存活。取不到（None/非数字）时按"存活"处理，交给 _probe 判定。
-
-    Windows 上 os.kill(pid, 0) 对已退出进程仍可能成功，故额外用
-    OpenProcess 查退出码；两者都不可用时退回 True，绝不因判错而弃掉活着的实例。
-    """
-    try:
-        pid = int(pid)
-    except (TypeError, ValueError):
-        return True
-    if pid <= 0:
-        return False
-    if os.name == 'nt':
-        try:
-            import ctypes
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            STILL_ACTIVE = 259
-            k32 = ctypes.windll.kernel32
-            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
-            if not h:
-                return False                  # 进程不存在或无权限 → 视为已退
-            try:
-                code = ctypes.c_ulong()
-                if k32.GetExitCodeProcess(h, ctypes.byref(code)):
-                    return code.value == STILL_ACTIVE
-            finally:
-                k32.CloseHandle(h)
-            return True
-        except Exception:
-            return True
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True                        # 存在但无权限
-    except Exception:
-        return True
-
-
-def find_running(d=None, host='127.0.0.1', port=DEFAULT_PORT, span=0):
-    """找出已在运行的看板端口，找不到返回 None。
-
-    优先读 `<run_dir>/hub.json` —— 服务启动时自报端口，只需 **1 次**探测。
-    `span=0`（默认）不做端口扫描：本机探测一个关闭端口要等满超时（实测 0.3s/个），
-    扫 24 个就是 7 秒，绝不能放进常规路径。需要时显式传 span。
-
-    ⚠️ **必须同时校验 pid 存活**（2026-10-03 修「面板闪一下就没了」）：
-    端口可连不等于本看板在跑。端口被别的进程占用时，_probe 会拿到非本看板的
-    响应；hub.json 里的 pid 也可能早已死掉而端口恰好被别人用上。
-    两种情况都会让 find_running 误判"已在跑"→ 复用了一个不通的地址 →
-    面板加载不出来、只剩空白或连接中断指示灯。
-    """
-    cands = []
-    try:
-        hp = run_dir(d) / HUB_STATE
-        if hp.is_file():
-            info = json.loads(hp.read_text(encoding='utf-8'))
-            if isinstance(info.get('port'), int):
-                cands.append((info['port'], info.get('pid')))
-    except Exception:
-        pass
-    if not any(p == port for p, _ in cands):
-        cands.append((port, None))
-    if span:
-        cands += [(port + i, None) for i in range(1, span)]
-    for p, pid in cands:
-        if pid is not None and not _pid_alive(pid):
-            continue                      # 记录指向死进程，不探这个端口
-        if _probe(host, p):
-            return p
-    return None
-
-
-def progress_mode(mode=None):
-    """auto（默认，自动拉起并开窗）/ manual（只在已开时上报）/ off（完全关闭）。"""
-    m = (mode or os.environ.get('BILI_PROGRESS') or 'auto').strip().lower()
-    return m if m in ('auto', 'manual', 'off') else 'auto'
-
-
-def _spawn_hub(args):
-    """脱离父进程启动看板，让它在流水线结束后继续存活。
-
-    Windows 上光有 DETACHED_PROCESS 不够：若宿主把进程树放进 Job Object 且设了
-    "关闭即杀"，脱离旗标也保不住——实测被宿主回收过。故再叠加
-    CREATE_BREAKAWAY_FROM_JOB 逃出 Job；该标志要求 Job 允许 breakaway，
-    被拒时（ERROR_ACCESS_DENIED）退回不带它的组合，保证至少能起来。
-    """
-    import subprocess
-    base = {'close_fds': True, 'stdout': subprocess.DEVNULL,
-            'stderr': subprocess.DEVNULL, 'stdin': subprocess.DEVNULL}
-    if os.name != 'nt':
-        return subprocess.Popen(args, start_new_session=True, **base)
-    DETACHED, NEW_GROUP, BREAKAWAY = 0x00000008, 0x00000200, 0x01000000
-    try:
-        return subprocess.Popen(args, creationflags=DETACHED | NEW_GROUP | BREAKAWAY, **base)
-    except OSError:
-        return subprocess.Popen(args, creationflags=DETACHED | NEW_GROUP, **base)
-
-
-def ensure_serving(run_dir_=None, host='127.0.0.1', port=DEFAULT_PORT,
-                   open_window=True, mode=None, wait=10.0):
-    """保证看板在跑，返回访问用的 URL（拿不到就返回 None）。
-
-    - 已在跑 → 直接返回 URL，**不再开窗**（单实例，避免弹一堆窗口）
-    - 没在跑且 mode=auto → 以脱离进程启动看板并开窗
-    - mode=manual / off → 不自动拉起
-    """
-    m = progress_mode(mode)
-    if m == 'off':
-        return None
-    found = find_running(run_dir_, host, port)
-    if found:
-        return 'http://%s:%d' % (host, found)
-    if m != 'auto':
-        return None
-
-    args = [sys.executable, str(Path(__file__).resolve()), '--serve',
-            '--port', str(port), '--host', host]
-    if run_dir_:
-        args += ['--dir', str(run_dir_)]
-    if open_window:
-        args += ['--open']
-    try:
-        _spawn_hub(args)
-    except Exception:
-        return None
-    # 等子进程就绪：靠它自报的 hub.json 定位端口（端口可能因占用而回退）
-    deadline = time.time() + wait
-    while time.time() < deadline:
-        time.sleep(0.25)
-        found = find_running(run_dir_, host, port)
-        if found:
-            return 'http://%s:%d' % (host, found)
-    return None
-
-
-def serve(d=None, port=DEFAULT_PORT, host='127.0.0.1', open_window=False):
-    rd = run_dir(d)
-    if host not in ('127.0.0.1', 'localhost', '::1'):
-        print('[警告] 绑定到 %s：看板无鉴权，同一网络内任何人都能读取任务信息与标题。'
-              % host, flush=True)
-    httpd = _bind(host, port)
-    httpd.run_dir = rd
-    # 必须用**实际绑定**的端口：端口回退后请求端口可能与真实监听端口不一致，
-    # 用请求端口拼 URL 会让 --open 打开一个空地址。
-    actual = httpd.server_address[1]
-    url = 'http://%s:%d' % (host, actual)
-    # 自报端口：让 ensure_serving 一次探测即可定位，不必扫描端口段
-    hp = rd / HUB_STATE
-    try:
-        hp.write_text(json.dumps({'port': actual, 'pid': os.getpid(),
-                                  'started': time.time(), 'url': url},
-                                 ensure_ascii=False),
-                      encoding='utf-8')
-    except Exception:
-        pass
-    print('看板已启动: %s   (运行目录 %s)' % (url, rd), flush=True)
-    if open_window:
-        # 非 daemon 线程：daemon 线程会在主线程退出时连带消失，开窗还没执行就夭折。
-        # 内部自己吞异常，保证开窗失败不影响 serve_forever。
-        def _open():
-            try:
-                _open_app_window(url)
-            except Exception as e:
-                print('开窗失败（服务仍在运行，可手动访问 %s）：%s' % (url, e),
-                      flush=True)
-        threading.Thread(target=_open, daemon=False).start()
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        # 只清理自己写的那份，别把后来者的记录删掉
-        try:
-            if hp.is_file() and json.loads(hp.read_text(encoding='utf-8')).get('pid') == os.getpid():
-                hp.unlink()
-        except Exception:
-            pass
-
-
-class _Server(ThreadingHTTPServer):
-    # Windows 上 SO_REUSEADDR 的语义与 POSIX 不同：它**允许两个进程绑同一端口**，
-    # 后绑的会悄悄抢走连接而不报错——于是"端口被占用"永远检测不到，
-    # 可能同时跑起两个看板互相抢请求。所以 Windows 必须关掉。
-    # POSIX 保持开启，进程重启后能立即复用端口。
-    allow_reuse_address = os.name != 'nt'
-
-
-def _bind(host, port, tries=12):
-    """端口被占用时自动向后找可用端口，而不是抛栈退出。"""
-    last = None
-    for i in range(tries):
-        p = port + i
-        try:
-            return _Server((host, p), Handler)
-        except OSError as e:
-            # 不按错误码判断：Windows 的报错文案会随系统语言变化
-            last = e
-            print('端口 %d 不可用（%s），尝试 %d…' % (p, e, p + 1), flush=True)
-            continue
-    raise SystemExit('连续 %d 个端口都不可用，最后错误：%s' % (tries, last))
-
-
-def _open_app_window(url):
-    """用 Chromium 系浏览器的 --app 模式开一个无地址栏的独立窗口。
-
-    这样不用装 pywebview 也能得到"原生窗口"观感；找不到浏览器则退回默认浏览器开标签页。
-    """
-    import shutil
-    import subprocess
-    # PATH 里通常没有 msedge/chrome（Windows 不把它们加进 PATH），
-    # 所以要同时探常见安装路径，否则 --open 会静默退化成标签页。
-    known = {
-        'msedge': [r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
-                   r'C:\Program Files\Microsoft\Edge\Application\msedge.exe'],
-        'chrome': [r'C:\Program Files\Google\Chrome\Application\chrome.exe',
-                   r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe'],
-    }
-    exe = None
-    for name in ('msedge', 'chrome', 'chromium'):
-        exe = shutil.which(name) or next(
-            (p for p in known.get(name, []) if os.path.exists(p)), None)
-        if exe:
-            break
-    if exe:
-        # 独立 profile：否则 --app 会挂进已有浏览器进程，--window-size 会被忽略
-        prof = Path.home() / '.workbuddy' / 'tmp' / 'dash_profile'
-        try:
-            # 必须让浏览器**脱离**本进程组：不脱离时它是本服务的子进程，
-            # 服务一旦退出（端口耗尽 SystemExit、宿主 Job Object 回收 Ctrl-C），
-            # 浏览器随之被一起收掉，用户看到的就是「面板闪一下就没了」。
-            # 与 _spawn_hub 同一套旗标：BREAKAWAY 被拒时退回 DETACHED| NEW_GROUP。
-            flags = {'close_fds': True, 'stdout': subprocess.DEVNULL,
-                     'stderr': subprocess.DEVNULL, 'stdin': subprocess.DEVNULL}
-            args = [exe, '--app=%s' % url, '--window-size=1280,900',
-                    '--user-data-dir=%s' % prof]
-            if os.name != 'nt':
-                subprocess.Popen(args, start_new_session=True, **flags)
-            else:
-                DETACHED, NEW_GROUP, BREAKAWAY = 0x00000008, 0x00000200, 0x01000000
-                try:
-                    subprocess.Popen(args, creationflags=DETACHED | NEW_GROUP | BREAKAWAY,
-                                     **flags)
-                except OSError:
-                    subprocess.Popen(args, creationflags=DETACHED | NEW_GROUP, **flags)
-            print('已用独立窗口打开（%s --app）' % Path(exe).name, flush=True)
-            return True
-        except Exception:
-            pass
-    try:
-        import webbrowser
-        webbrowser.open(url)
-        print('已用默认浏览器打开（未找到 Chromium 系，退化为标签页）', flush=True)
-    except Exception:
-        pass
-    return False
-
-
-# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def _demo(d, n=6):
-    """造一份假数据，用于预览外观。"""
+    """造一份假数据，用于预览 --status 的输出。"""
     tasks = []
     names = ['示例：一座城市的产业迁移史', '示例：从零读懂一项公共政策',
              '示例：三十分钟讲清一个技术概念', '示例：一场自然灾害的应急复盘',
@@ -1384,17 +989,13 @@ def _demo(d, n=6):
 
 
 def main():
-    ap = argparse.ArgumentParser(description='任务进度看板')
+    ap = argparse.ArgumentParser(description='任务进度')
     ap.add_argument('--dir', default=None, help='运行目录（默认 $BILI_PROGRESS_DIR）')
-    ap.add_argument('--status', action='store_true',
-                    help='打印当前批次的纯文本进度（不起服务、不开浏览器）')
-    ap.add_argument('--serve', action='store_true', help='启动看板服务')
-    ap.add_argument('--ensure', action='store_true',
-                    help='确保看板在跑（已在跑则只返回地址、不重复开窗）；配合 --open 可开窗')
-    ap.add_argument('--port', type=int, default=DEFAULT_PORT)
-    ap.add_argument('--host', default='127.0.0.1')
-    ap.add_argument('--open', dest='open_window', action='store_true',
-                    help='用 Chromium 系浏览器的 --app 模式开独立窗口（无地址栏）')
+    fmt = ap.add_mutually_exclusive_group()
+    fmt.add_argument('--status', action='store_true',
+                     help='打印当前批次的纯文本进度')
+    fmt.add_argument('--json', dest='json_out', action='store_true',
+                     help='打印当前批次的 JSON（给外部程序读）')
     ap.add_argument('--demo', action='store_true', help='生成演示数据')
     ap.add_argument('--init', action='store_true', help='用 --tasks 初始化一次运行')
     ap.add_argument('--new-batch', action='store_true',
@@ -1403,20 +1004,18 @@ def main():
     ap.add_argument('--tasks', help='任务清单 JSON 文件或 JSON 字符串')
     ap.add_argument('--title', default='任务批次')
     ap.add_argument('--engine', default='funasr-nano')
-    ap.add_argument('--group', default=None, help='任务组名（两个 skill 共用一个看板时区分来源）')
+    ap.add_argument('--group', default=None, help='任务组名（两个 skill 共用一个运行目录时区分来源）')
     ap.add_argument('--emit', action='store_true', help='上报一条事件')
     ap.add_argument('--task')
     ap.add_argument('--stage')
     ap.add_argument('--pct', type=float)
     ap.add_argument('--elapsed', type=float,
-                    help='本阶段已用秒数（生成纪要这类阶段必传，否则看板没有依据）')
+                    help='本阶段已用秒数（生成纪要这类阶段必传，否则进度没有依据）')
     ap.add_argument('--kind', choices=list(KINDS),
                     help='事件角色（可选）：begin 阶段开始 / report 进行中 / end 阶段结束')
     ap.add_argument('--duration-sec', type=float, dest='duration_sec',
                     help='音频时长（秒），用于推算预计剩余')
     ap.add_argument('--note')
-    ap.add_argument('--progress-mode', default=None,
-                    help='auto（默认，自动拉起）/ manual（只在已开时上报）/ off（关闭）')
     ap.add_argument('--compact', action='store_true',
                     help='折叠历史事件为快照，并退役（删除）已停止写入的旧事件文件')
     ap.add_argument('--safe-age', type=int, default=COMPACT_SAFE_AGE,
@@ -1462,6 +1061,8 @@ def main():
         return
     if a.status:
         return print_status(a.dir)
+    if a.json_out:
+        return print_json(a.dir)
     if a.list_batches:
         rows = list_batches(a.dir)
         if not rows:
@@ -1470,17 +1071,11 @@ def main():
             print('  %-30s %s/%s  %s' % (r['name'], r['done'], r['total'],
                                          r['title'] or ''))
         return
-    if a.ensure:
-        url = ensure_serving(a.dir, a.host, a.port, a.open_window, a.progress_mode)
-        print(url or '未能启动看板（mode=%s）' % progress_mode(a.progress_mode))
-        return
     if a.emit:
         ok = emit(task=a.task, stage=a.stage, pct=a.pct, elapsed=a.elapsed,
                   duration_sec=a.duration_sec, note=a.note, group=a.group,
                   kind=a.kind, d=a.dir)
         return print('emit', 'ok' if ok else 'failed')
-    if a.serve:
-        return serve(a.dir, a.port, a.host, a.open_window)
     ap.print_help()
 
 

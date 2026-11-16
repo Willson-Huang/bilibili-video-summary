@@ -53,7 +53,7 @@ DEFAULT_INFER_BATCH = 1
 # --------------------------------------------------------------------------- #
 # 进度上报（可选）
 # 由环境变量 BILI_PROGRESS_DIR 启用；未设置时全部为空操作。
-# 任何异常一律吞掉 —— 进度是旁路，绝不能让看板拖垮转写。
+# 任何异常一律吞掉 —— 进度是旁路，绝不能让进度上报拖垮转写。
 # Nano 一次 generate 处理整条音频、没有细粒度回调，故按
 # 「已用时间 / (音频时长 ÷ 实测倍率)」插值出百分比。
 # 倍率优先取 observed_rtf()（从已完成任务实测，批量约 2.1x），
@@ -125,7 +125,7 @@ class _AsrReporter:
 
         只发到 transcribed（非终态）——「已完成」要等纪要写完，由主 agent 上报。
         这里若直接发 done，终态锁会让后到的 notes 事件永远不生效，
-        看板就会在还要生成纪要的时候显示「已完成 / 预计剩余 0s」。
+        进度就会在还要生成纪要的时候显示「已完成 / 预计剩余 0s」。
         """
         try:
             self._stop.set()
@@ -211,8 +211,10 @@ def group_tokens(r0, gap=0.3, max_chars=60):
             out.append(cur)
             cur = {'start': st, 'end': en, 'text': tok}
         elif prev and _ascii_alnum(prev) and _ascii_alnum(tok[:1] or ''):
-            # 英文/数字 token 之间补空格，避免拼成 "Therearenostrangerstolove"
-            cur['text'] += ' ' + tok
+            # 英文 token 之间补空格，避免拼成 "Therearenostrangerstolove"；
+            # 数字之间直接拼接，否则四位年份会被拆成「19 54年」、千位串被拆成「11 37座」
+            sep = '' if (prev.isdigit() and tok[0].isdigit()) else ' '
+            cur['text'] += sep + tok
             cur['end'] = en
         else:
             cur['text'] += tok

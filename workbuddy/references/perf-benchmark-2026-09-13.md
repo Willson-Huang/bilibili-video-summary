@@ -135,7 +135,54 @@ PYTHONPATH= <asr_eval python> funasr_adapter.py --audio bench_180_16k.wav \
 python -c "import sys; sys.path.insert(0,'<skill>/scripts'); import bili_asr; bili_asr._setup_cuda_dlls()"
 ```
 
-## 8. 更新记录
+## 8. 现场实测与批量口径
+
+`large-v3-turbo` 在 CUDA 上约 **20.5x** 实时（689.7s 音频转写 33.7s，1 小时视频约 3 分钟），`large-v3` 约 6.5x（同段 106.6s）；1:39:28 长视频下载 44s 加转写 243s。
+
+**批量处理：整批只加载一次模型**
+
+`library_queue.py` 分两阶段执行，阶段二用 `--batch-file` 把整批转写合并成一次调用：
+
+| 阶段 | 动作 | 模型加载次数 |
+|---|---|---|
+| 一 | 逐条查重 + 补元信息（view 落 `~/.workbuddy/cache/bili/meta/`） | 0 |
+| 二 | `--batch-file` 一次性转写全部（view 直接命中阶段一缓存） | 1 |
+
+省下的是 (N-1) × 4s 的模型加载、每次的进程启动开销、阶段二重复请求 view 接口的往返。10 条约省 40–50s。
+
+```bash
+# items: [{"url": "...", "out": "路径.md"}, ...]
+"<skill>/scripts/bili.bat" --batch-file <items.json> --model large-v3-turbo
+
+# Git Bash / 非 Windows / 自建 Python（等价写法）
+PYTHONPATH= HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_SYMLINKS=1 HF_HUB_DISABLE_XET=1 \
+  <python> "<skill>/scripts/bili_asr.py" --batch-file <items.json> --model large-v3-turbo
+```
+
+输出 `{"ok": true, "count": N, "results": [...]}`，单条失败记在 `results[].error`，不中断整批。
+
+**音频不转码**：yt-dlp 直接落 B站原生 m4a（AAC），PyAV 可直接解码，省掉 ffmpeg 转码。下载环节从 3s 降到 2.5s，且不再依赖 `--audio-format` 转换。
+
+**已否决的提速方案，不要再试**：`BatchedInferencePipeline`（快 2.05x，但出现幻觉与错字）· 降低 `beam_size` · 音频降码率 · 并行下载流水线 · Nano 侧调 `batch_size` / VAD / 砍热词 / 双进程 · 给 whisper 加专名提示词 · 换 Qwen3-ASR-1.7B。逐项依据见本文第 3、4、6 节。
+
+## 9. 精度结论：turbo 与 large-v3
+
+中文口语场景下，turbo 与 large-v3 的准确率差距远小于 3 倍的速度差：
+
+- large-v3 正确、turbo 错：生态位、姓魏的商人、小浣熊、沈殿霞
+- 两者共同短板：人名、品牌名、金额数字（「安藤百福」写成「安等/安登百福」；「一角五分」写成「一脚五分/195分」）
+
+结论：默认 turbo。术语密集或需逐字引用时才用 large-v3；数字与专名在产出中一律标注 `[原文疑似]`，并在「信息完整性」列出误识对照表。
+
+## 10. 分段计时与元信息缓存
+
+返回 JSON 增加 `timing.meta_sec`（view 与字幕抓取耗时），ASR 结果拆分 `model_load_sec`（模型加载，仅首条非 0）与 `asr_sec`（纯转写，不混入加载时间）。`asr_sec` 语义沿用，台账「转写耗时(秒)」字段不受影响。
+
+元信息带 24h 本地缓存（`~/.workbuddy/cache/bili/meta/<BV>.json`）：批量队列先 `--meta-only` 跑一遍补元信息，随后转写阶段直接命中缓存，不再重复请求 view 接口。
+
+`--only-meta` 只请求 view 接口，不再顺带抓章节与评论，预扫描从 3–4 次请求降到 1 次。要看章节与热评走完整转写。
+
+## 11. 更新记录
 
 | 日期 | 变更 |
 |---|---|

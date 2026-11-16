@@ -363,7 +363,7 @@ def download_audio(url, out_dir, cookie=None, page=1, stem='audio'):
     cmd.append(cu)
     try:
         # 这是全脚本唯一需要给超时的地方：下载卡住时没有超时会挂起整个批次，
-        # 而看板只能显示「下载音频…」，看不出是卡住还是在跑。
+        # 而进度只能显示「下载音频…」，看不出是卡住还是在跑。
         p = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
                            errors='replace', timeout=DL_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -416,7 +416,7 @@ def _setup_cuda_dlls():
 
 
 def _ensure_progress_dir():
-    """未显式配置时，把看板运行目录落回当前项目（2026-09-19 起「默认自动」才名副其实）。
+    """未显式配置时，把进度运行目录落回当前项目（2026-09-19 起「默认自动」才名副其实）。
 
     规则（与 obsidian-wiki-compiler 的 wiki_state.py 保持一致，两处不可各改一套）：
       1. `BILI_PROGRESS_DIR` 已设 → 尊重，不动
@@ -461,11 +461,10 @@ PROG_GROUP = 'B站转写'
 
 
 def _prog_boot(p, items, title='B站视频转录', engine='funasr-nano'):
-    """启用进度时：单实例拉起看板 + 写入任务清单。
+    """启用进度时：写入本批任务清单。
 
-    - 看板已在跑就**只复用、不再开窗**（否则跑 20 条会弹 20 个窗口）
     - 标题/时长走 24h 元信息缓存（队列先跑过 --meta-only 时是零请求）
-    - 看板上一行＝一支视频：多 P 视频只登记裸 BV 号，各 P 的事件都归到这一行，
+    - 进度里一行＝一支视频：多 P 视频只登记裸 BV 号，各 P 的事件都归到这一行，
       页面按页分文件（`bili_<BV>_p<页>.md`），素材包与纪要仍是一页一份
     - 全程尽力而为：任何异常都吞掉，绝不影响转写
     """
@@ -474,7 +473,6 @@ def _prog_boot(p, items, title='B站视频转录', engine='funasr-nano'):
         if not d:
             return None
         os.environ.setdefault('BILI_PROGRESS_GROUP', PROG_GROUP)  # 子进程继承任务组
-        url = p.ensure_serving(d, open_window=True)
         tasks = []
         for it in items:
             try:
@@ -488,7 +486,7 @@ def _prog_boot(p, items, title='B站视频转录', engine='funasr-nano'):
                 V = fetch_meta(it['url'], page)
                 rec['title'] = V.get('title')
                 rec['up'] = (V.get('owner') or {}).get('name')
-                # 时长取整支视频的总长：多 P 视频看板上只有一行，预计剩余按全片算才
+                # 时长取整支视频的总长：多 P 视频进度里只有一行，预计剩余按全片算才
                 # 与实际相符；取某一 P 的时长会把整支视频的剩余时间算成零头。
                 rec['duration_sec'] = V.get('duration')
             except Exception:
@@ -498,7 +496,6 @@ def _prog_boot(p, items, title='B站视频转录', engine='funasr-nano'):
             # 一次批量转写＝一个批次：先把上一批整份归档，再写这一批（批次隔离）
             p.init_run(tasks, title=title, d=d, group=PROG_GROUP,
                        meta={'engine': engine}, new_batch=True)
-        return url
     except Exception:
         return None
 
@@ -932,12 +929,11 @@ def process_video(a, url_arg, out_path=None, holder=None, preset=None, in_batch=
     pinfo = next((x for x in pages if x['page'] == page), pages[0]) if page <= len(pages) else pages[0]
     cid = pinfo['cid']
 
-    # 单条模式：拿到元信息后立刻保证看板在跑并登记任务（单实例，已开则复用）
+    # 单条模式：拿到元信息后立刻登记任务
     _pb = _prog()
     if _pb and not in_batch:
         try:
             os.environ.setdefault('BILI_PROGRESS_GROUP', PROG_GROUP)
-            _pb.ensure_serving(_pb.progress_dir(), open_window=True)
             _pb.init_run([{'id': bvid, 'title': V['title'],
                            'up': V['owner']['name'],
                            'duration_sec': pinfo.get('duration') or V['duration'],
@@ -1195,8 +1191,8 @@ def main():
                               'engine': 'funasr-nano', 'results': results}, ensure_ascii=False))
             return
 
-        # whisper 批量：与 Nano 走同一个 _prog_boot，保证批量也登记看板任务。
-        # 缺这一步时看板只剩上一批的历史数据，本批从头到尾没有卡片（2026-10-03 实测）。
+        # whisper 批量：与 Nano 走同一个 _prog_boot，保证批量也登记进度任务。
+        # 缺这一步时进度里只剩上一批的历史数据，本批一条任务都没有（2026-10-03 实测）。
         _pw = _prog()
         if _pw:
             _prog_boot(_pw, items, engine=a.engine)

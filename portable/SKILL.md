@@ -1,7 +1,7 @@
 ---
 name: bilibili-video-summary
 description: 用户发送 B站（bilibili）视频链接、BV号、av号或 b23.tv 短链，要求总结视频观点/要点/内容，或要求把视频内容整理成知识库条目时使用。三条路由自动选择：优先字幕直取（秒级，需登录态），无字幕或字幕不可信时走本地 ASR（whisper / Fun-ASR-Nano 双引擎，GPU 加速），再基于全文生成 14 节知识库条目（含 YAML 元数据、检索入口表、实体表、时间线、存疑标注、术语表）。本版本为「便携版」——不依赖 WorkBuddy 与 IMA，纯标准 Python/Node 脚本 + Markdown 指令，可直接装到 Claude / Cursor / ChatGPT 自定义 GPT 等任意支持自定义指令的 AI 平台。触发词：B站、bilibili、BV号、b23.tv、这个视频讲了什么、总结视频、视频要点、存知识库、知识库条目、B站归档。
-version: 2.9.1-portable
+version: 2.11.3-portable
 agent_created: true
 ---
 
@@ -81,11 +81,13 @@ python scripts/bili_asr.py "<链接>" --model large-v3-turbo --out "素材包/bi
 | 参数 | 说明 |
 |---|---|
 | `--model` | `large-v3-turbo`（默认，速度与精度平衡）/ `large-v3`（最准）/ `medium`（最快） |
+| `--out <路径>` | 素材包落盘位置。写当批缓存目录下，别直接写进 `raw/` |
 | `--p N` | 指定分P |
 | `--force-asr` | 跳过 B站字幕直取，强制本地转写 |
 | `--cookie "..."` | 会员视频 / 高码率音源 / 触发字幕路由时使用（也可走 `set-cookie.mjs` 存文件） |
 | `--keep-audio` | 保留音频（默认转写后删除） |
 | `--only-meta` | 只抓元信息，判断视频是否值得细看 |
+| `--classify` | 配合 `--only-meta` 用：多调一次 tag 接口，在返回里给 `engine_suggestion`（whisper / funasr-nano）。新 UP 主先跑这个再定引擎 |
 | `--batch-file <json>` | **批处理模式**：`[{"url":..., "out":...}]`，整批只加载一次模型 |
 
 **单条**与**批处理**共用同一套逻辑，区别只在模型加载次数。批量任务一律走批处理。
@@ -145,7 +147,7 @@ python scripts/bili_asr.py "<链接>" --engine funasr-nano --hotwords <热词文
 
 判定优先级：① `references/engine_up_whitelist.txt` 白名单 → ② **视频 tag**（官方公开接口，实测比分区准）→ ③ 分区（可选，需自备映射表）→ ④ 标题/简介关键词打分 → ⑤ 默认 whisper。
 
-> ⚠️ **多语种混合长音频**（中文旁白 + 外语受访段交替，如全球采访类 UP主）：whisper 侧 `--lang` **不做 auto 映射**（默认 `zh` 会把外语段音译成汉字串），且 faster-whisper 只在首窗（约 30s）检测一次语种。这类内容单跑一遍拿不到正确结果，需按段落切分处理；详版说明见仓库 `workbuddy/SKILL.md` 的「语言参数」节 <https://github.com/Willson-Huang/bilibili-video-summary/blob/main/workbuddy/SKILL.md>（便携包内不含该文件，故给链接）。
+> ⚠️ **多语种混合长音频**（中文旁白 + 外语受访段交替，如全球采访类 UP主）：whisper 侧 `--lang` **不做 auto 映射**（默认 `zh` 会把外语段音译成汉字串），且 faster-whisper 只在首窗（约 30s）检测一次语种。这类内容单跑一遍拿不到正确结果，需按段落切分处理；详版说明见本包内 `references/asr-tactics.md`。
 
 **代价不对称**：漏切（仍用 whisper）= 维持现状；误切 = 慢 3-10 倍且英文质量下降。**灰区一律判 whisper。**
 
@@ -308,51 +310,42 @@ python scripts/process_queue.py --model large-v3
 纪要按「整部系列出一份」还是「每个 P 一份」由内容决定——判断标准是**该 P 能否独立成篇**：
 能独立成篇就每个 P 一份，否则合并成一份并在正文注明覆盖的页号范围。
 
-⚠️ **看板上是一支视频一行**：多 P 视频只登记裸 BV 号，各 P 的事件都归到这一行；
+⚠️ **进度里是一支视频一行**：多 P 视频只登记裸 BV 号，各 P 的事件都归到这一行；
 素材包与纪要仍是一页一份。`task_of()` 与 `_norm_id()` 把「BV 号＋`_p<页>`」的写法一律
 归并成裸 BV 号——上报侧把音轨名整串（`BV1xxx_p1.m4a`）当任务名传进来时，不归并就会
 给同一支视频单开一行（无标题，显示成裸编号），顶部任务数虚增、总进度被摊薄。
 
-⚠️ **分P 的时长取全片总长**：`V['duration']` 是整支视频的总长，看板一行代表整支视频，
+⚠️ **分P 的时长取全片总长**：`V['duration']` 是整支视频的总长，一行代表整支视频，
 预计剩余按它算才与实际相符；若改用某一 P 的时长，整支视频的剩余时间会被算成一个零头。
 
 ⚠️ **素材包按页配套**：`verify_pack.py` 按素材包头部声明的「分P：N/M」核对页号是否齐全，
 缺尾页（P5 丢失只剩 P1–P4）也能查出 —— 只按文件名清点时，目录里有的那几份看起来总是齐的。
 
-## 进度看板（独立窗口）
+## 任务进度
 
-长任务（10 条 × 25 分钟音频 ≈ 1 小时）看不到进度会让人焦虑。看板把「每条任务当前在做什么、走到几成、还剩多久」实时摊开。**stdlib-only 自建 + 浏览器 `--app` 独立窗口**，零依赖、跨两个 venv 都能用（选型调研、数据流与算法实现见 `references/progress-hub-design.md`）。
-
-### 查看进度（默认用文本）
+长任务（10 条 × 25 分钟音频 ≈ 1 小时）需要随时看到「每条任务当前在做什么、走到几成、还剩多久」。进度数据由管线各进程上报事件流，查看方式是 `--status`：读同一份快照、打印纯文本。数据流、百分比算法与实现笔记见 `references/progress-hub-design.md`。
 
 ```bash
 python scripts/progress_hub.py --status          # 打印当前批次：整体进度、每条任务的阶段与耗时
+python scripts/progress_hub.py --json            # 同一份内容的 JSON 版，给脚本与外部程序读
+python scripts/progress_hub.py --list-batches    # 列出已归档的批次
 ```
 
-日常看一眼进度用这一条，不起服务、不开浏览器。同一份快照、同样的口径，适合随时随手跑。
-
-### 启动
+**连着盯屏幕**：用随技能带的启动器，每两秒清屏重打一次 ——
 
 ```bash
-# 独立窗口（推荐）：Edge/Chrome 的 --app 模式，无地址栏，观感接近原生应用
-python scripts/progress_hub.py --serve --port 8765 --dir <运行目录> --open
-
-# 或双击脚本（自动探 Python 与浏览器路径）
-#   不传参时须在项目根运行；也可直接传项目根，脚本会自动补成标准运行目录
-scripts/bili_dashboard.bat [运行目录或项目根] [端口]
+scripts\progress_watch.bat                 # Windows：在项目目录里运行（也可双击）
+scripts\progress_watch.bat <项目根>         # 也可显式指定项目目录
+./scripts/progress_watch.sh                # macOS / Linux
 ```
 
-Windows 上 `msedge.exe` / `chrome.exe` 通常**不在 PATH**，脚本内置常见安装路径探测；找不到则退化为默认浏览器标签页。
+启动器自己找进度目录：先看参数，再看 `BILI_PROGRESS_DIR`，都没有就从**当前目录**向上找含 `.workbuddy` 的目录。找不到会打印提示并停住，不会一闪而过。Python 解释器按 `BILI_PYTHON` → `PATH` 依次探测（macOS / Linux 用 `python3`）。文件里不含任何本机路径，随技能复制到别的机器可直接用。
 
-### 上报默认开启与单实例
+⚠️ **百分比是插值估算，不是精确进度**：Nano 一次 `generate` 处理整条音频、没有细粒度回调，单条百分比按「已用时间 ÷（音频时长 ÷ 实测倍率）」插值，上限截到 97%。倍率取三档（本批实测 → 批量兜底 2.1x → 单条常量），来源随状态一并给出。阶段边界由脚本上报，这一段是精确的。
+
+### 上报默认开启与运行目录
 
 **上报默认开启**：转写时会自动登记任务。运行目录未设时按项目自动推导（见下）。
-
-| 开关 | 行为 |
-|---|---|
-| `auto`（**默认**） | 没有在跑就后台拉起看板并开窗；已在跑就**只复用** |
-| `manual` | 不自动拉起，只在已经开着时上报 |
-| `off` | 完全关闭（连模块都不加载） |
 
 **运行目录解析顺序**（`bili_asr.py` 的 `_ensure_progress_dir()`，只做 `setdefault`、不覆盖显式配置）：
 
@@ -363,41 +356,17 @@ Windows 上 `msedge.exe` / `chrome.exe` 通常**不在 PATH**，脚本内置常�
 
 **批次隔离（2026-10-02）**：运行目录名固定是 `current`，但每个批次只写自己那一份 ——
 一次新的转写运行（批量或单条）会把上一批整份搬进 `batches/<时间>-<来源>/`，再重建空的
-`current`。看板看到的始终是「本批」，历史批在顶部的选择器里切回。手工开一批用
-`progress_hub.py --init --new-batch --tasks ...`；列出已归档批次用 `--list-batches`。
+`current`，所以看到的始终是「本批」，历史批用 `--list-batches` 回看。手工开一批用
+`progress_hub.py --init --new-batch --tasks ...`。
 ⚠️ **补数据、登记待编译的一方不要传 `new_batch`** —— 那会连自己刚写进去的一起搬走。
 
 > ⚠️ **上报链路 `try/except` 全吞**：运行目录解析失败或上报未启用时，**退出码仍是 0、零日志**，从外部看不出被跳过。要确认在跑，看运行目录下有没有 `events_*.jsonl`。
-
-⚠️ **看板服务必须由用户手动常驻一次**：`ensure_serving()` 能在同一条命令内拉起服务
-（实测 `/api/health` 返 200），但**服务活不过该条 agent 命令**——宿主 Job Object 会在命令
-结束时回收整棵进程树（`DETACHED | BREAKAWAY` 也逃不出）。分工：**服务由用户启动一次**
-（`bili_dashboard.bat [项目根]`），转写侧只负责**写 events**；服务在跑时会自动聚合。
 
 ```bash
 BILI_PROGRESS=off python bili_asr.py ...        # 单次关闭
 ```
 
-**单实例必须保证**（否则跑 20 条视频会弹 20 个窗口）：`hub.json` 记录实际端口 + 只读该文件不扫端口段 + **裸 socket 累积读**（不用 `urllib`）三层保证。实现细节与踩坑原因见 `references/progress-hub-design.md`。
-
-**「面板闪一下就没了」的四处根因（2026-10-03 修）** —— 现象是面板弹出后立刻自动消失：
-
-| # | 根因 | 位置 | 修法 |
-|---|---|---|---|
-| 1 | **浏览器进程未脱离父进程**：`subprocess.Popen` 起的 msedge 是服务子进程，服务一退出（`SystemExit` / Job Object 回收 / Ctrl-C）窗口被一起收掉 | `_open_app_window` | 改用 `DETACHED\|NEW_GROUP\|BREAKAWAY`（Windows）／`start_new_session`（POSIX），与 `_spawn_hub` 同一套旗标 |
-| 2 | **开窗线程是 daemon**：`daemon=True` 的线程在主线程退出时连带消失，开窗还没执行就夭折 | `serve` | 改 `daemon=False`，并在内部吞异常 |
-| 3 | **无 pid 校验**：`find_running` 只探端口。端口被**别的进程**占用时也返回「已跑」→ 复用了一个不通的地址 → 面板空白／连接中断 | `find_running` | 读 `hub.json` 时一并取 pid，先 `_pid_alive()` 再探端口；取不到 pid 时按存活处理 |
-| 4 | **`_bind` 的 `SystemExit` 抛在写 `hub.json` 之前** + 旧实例 `finally` 已删记录 → `find_running` 必然判定「没跑」→ 重复 `_spawn_hub` 弹第二个窗，两者抢同一端口，前者被挤掉 | `serve` / `_bind` | 由第 3 项的 pid 校验兜住 |
-
-⚠️ **`_pid_alive` 在 Windows 上不能只用 `os.kill(pid, 0)`** —— 对已退出进程仍可能成功；
-必须用 `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `GetExitCodeProcess` 查 `STILL_ACTIVE(259)`。
-判定不确定时一律返回 `True`，**绝不因判错而弃掉活着的实例**（那会造成第二次闪烁）。
-
-⚠️ **事件解析在锁内完成**：`_load_raw()` 原来是「锁内查缓存 → 锁外读文件解析 → 锁内写回」，
-两个请求同时未命中时会把同一批事件重复解析两遍。每个请求一个线程，轮询 + 批次列表 +
-首屏请求会并发触发它，任务量大时表现为 CPU 抖动、响应时间忽长忽短。改为整段在锁内解析。
-
-**两个 skill 共用一个窗口**：`init_run()` 是**并入**语义，不是替换——转写与 wiki 编译的任务清单在同一个 `run.json` 里共存，靠 `group` 字段区分。
+**两个 skill 共用一个运行目录**：`init_run()` 是**并入**语义，不是替换——转写与 wiki 编译的任务清单在同一个 `run.json` 里共存，靠 `group` 字段区分。
 
 ### 三种上报方式
 
@@ -411,7 +380,7 @@ BILI_PROGRESS=off python bili_asr.py ...        # 单次关闭
 
 | 症状 | 根因 | 修法 |
 |---|---|---|
-| whisper 批量在看板上**一条卡片都没有** | 批量分支只在 `engine == 'funasr-nano'` 时调 `_prog_boot`，whisper 批量整段没登记 | 批量分支统一调 `_prog_boot(_p, items, engine=a.engine)` |
+| whisper 批量**一条都没登记** | 批量分支只在 `engine == 'funasr-nano'` 时调 `_prog_boot`，whisper 批量整段没登记 | 批量分支统一调 `_prog_boot(_p, items, engine=a.engine)` |
 | 批量跑完 `current/run.json` **只剩最后一条** | `process_video` 每条都传 `new_batch=True`，每条把上一条刚写的清单搬进归档 | 加 `in_batch` 参数：批量调用时传 `True`，只上报阶段、**不开新批次** |
 
 **主 agent 的两个上报点（缺一不可）**：转写脚本只报到 `transcribed`（待生成纪要），
@@ -434,8 +403,7 @@ BILI_PROGRESS_DIR="<run_dir>" python scripts/bili_asr.py --batch-file ... --engi
 ### 设计约束
 
 - 上报是**旁路**：`emit()` 内部 `try/except` 全吞，任何异常都不影响转写；`BILI_PROGRESS_DIR` 未设置时连模块都不导入
-- 看板服务只读运行目录，**不写任何管线产物**，可随时启停，不影响正在跑的任务
-- 端口冲突时自动向后找可用端口（并打印**实际**监听地址）；默认只绑 `127.0.0.1`，绑到其它地址会打印无鉴权警告
+- `--status` 只读运行目录，**不写任何管线产物**，可随时运行，不影响正在跑的任务
 
 ## 广告过滤
 
@@ -497,11 +465,12 @@ BILI_PROGRESS_DIR="<run_dir>" python scripts/bili_asr.py --batch-file ... --engi
 产物落盘后立即跑，不要等用户发现：
 
 ```bash
-python scripts/verify_structure.py raw/<新生成的文件>.md
-python scripts/verify_structure.py --dir raw     # 全库体检
+cd <当批缓存目录>
+python "<本 skill 目录>/scripts/verify_structure.py" "<raw 目录>/<新生成的文件>.md"
+python "<本 skill 目录>/scripts/verify_structure.py" --dir "<raw 目录>"    # 全库体检
 ```
 
-详细结果写进当前目录的 `verify_structure_out.txt`，终端只打印末 6 行汇总（2026-09-24 起）。**在当批的缓存目录下执行**，日志就不会落在库根；要看逐条明细去读那个文件，不要为了省事把 `--dir` 的完整输出打到终端。
+详细结果写在**执行目录**下的 `verify_structure_out.txt`，终端只打印末 6 行汇总（2026-09-24 起）。先 `cd` 到当批的缓存目录再跑，别在技能目录或库根跑——技能目录应当只读，留在那里的日志会跟着技能包一起分发出去。要看逐条明细去读那个文件，不要为了省事把 `--dir` 的完整输出打到终端。
 
 校验四项：frontmatter 齐全（含 `keywords`；`type` 落在封闭枚举内、`tags` 每项带 `src/` `topic/` `entity/` 前缀）、`entities` 8–12、14 节齐全、内容要点已表格化。**任一项不通过就退回重写，不要带着结构缺陷交付。**
 
@@ -601,6 +570,26 @@ python scripts/bili_asr.py --batch-file <items.json> --model large-v3-turbo
 - 报 `cublas64_12.dll is not found`：CUDA DLL 未注册，检查 `nvidia-*` 包是否完好。
 - 报 `No such file or directory ... .m4a`：yt-dlp 产物路径解析失败，脚本已内置 stem 兜底，仍报错则检查 `--keep-audio` 与磁盘权限。
 - pip 装包必须传 `PYTHONPATH=`（清空平台注入的 shim），用国内镜像更快：`pip install -i https://mirrors.cloud.tencent.com/pypi/simple ...`
+
+## 参考资料索引
+
+本包把细节拆在 `references/` 下，主文档只留主流程与硬规则。按需读，不要一次全读。
+
+| 文件 | 什么时候读 |
+|---|---|
+| `knowledge-entry-template.md` | 生成条目、派发子代理前抄模板 |
+| `engine-routing.md` | 判断引擎、新 UP 主归类、白名单维护与验证 |
+| `asr-tactics.md` | 语言参数、多语种混合音频、热词、批量语义、双源做法 |
+| `queue-operations.md` | 批量台账、token 处理、分P、CSV 队列 |
+| `progress-hub-design.md` | 查看进度（`progress_hub.py --status`）、上报方式、百分比算法、批次隔离 |
+| `outputs-and-ima.md` | 产物去向与归档 |
+| `content-quality.md` | 广告词表细则、专名误识规则、校对三查、误识基线 |
+| `environment-and-login.md` | Cookie 配置、环境故障排查 |
+| `perf-benchmark-2026-09-13.md` | 引擎性能与提速方案的实测数据 |
+| `ad_keywords.txt` · `asr_glossary.txt` · `专名误识速查-主题组.txt` | 词表本体，脚本直接读取；速查表只作注意力提示，不作答案 |
+| `engine_up_whitelist.txt` · `engine_verify_log.txt` | UP主白名单与验证日志 |
+
+> 便携包不含 WorkBuddy 版的 IMA 知识库上传与「资料库在线表」队列，`outputs-and-ima.md` 里对应的那两节按「本地落盘即可」理解。
 
 ## 维护约定（2026-09-24 加）
 

@@ -13,11 +13,11 @@ import progress_hub as ph
 import library_queue as lq
 
 # 用法（本项目规范要求 Python 文件不加模块 docstring，说明放在 SKILL.md 与 main()）：
-#   python notes_done.py --dir <看板运行目录>                      补发
-#   python notes_done.py --dir <看板运行目录> --dry-run            只列出，不上报
+#   python notes_done.py --dir <进度运行目录>                      补发
+#   python notes_done.py --dir <进度运行目录> --dry-run            只列出，不上报
 #
 # 转写脚本只报到「待生成纪要」，最后一步「已完成」要由写纪要的一方补发，实测累计漏了 7 次。
-# 本脚本把这个动作改成对账：看板里还停在非终态的 BV 任务，只要它的标准纪要文件已经存在，
+# 本脚本把这个动作改成对账：进度里还停在非终态的 BV 任务，只要它的标准纪要文件已经存在，
 # 就补发一条完成事件。已标记完成的任务不在候选里，因此重复运行不会重复上报。
 
 TERMINAL = ('done', 'fail')
@@ -27,7 +27,7 @@ NOTE_SUFFIX = '_纪要.md'
 # 归一化时一律忽略的标点：引号（直/弯两式）与斜杠类。素材包头部与磁盘文件名常一边用
 # 直引号、一边用中文弯引号，逐字比对会漏配；`note_name()` 已经把直引号当非法字符剔除。
 NOISE = str.maketrans('', '', '"\'“”‘’、/\\')
-# 素材包文件名里的页号后缀（`bili_<BV>_p3.md`）。看板上多 P 合并成一行，
+# 素材包文件名里的页号后缀（`bili_<BV>_p3.md`）。进度上多 P 合并成一行，
 # 这里靠它把该 BV 的各页素材包找齐。
 PART_RE = re.compile(r'_p(\d+)$')
 
@@ -72,7 +72,7 @@ def _candidate_caches(hint):
 
 
 def resolve_run_dir(d, cache_dir):
-    """看板运行目录：显式给的优先，其次环境变量，最后从素材包目录同级推导。"""
+    """进度运行目录：显式给的优先，其次环境变量，最后从素材包目录同级推导。"""
     if d:
         return Path(d).resolve()
     got = ph.progress_dir()
@@ -89,7 +89,7 @@ def resolve_run_dir(d, cache_dir):
 def resolve_dirs(raw_dir, cache_dir, run):
     """定位纪要目录与素材包目录。
 
-    素材包缓存在知识库内部时（`<库>/.workbuddy/cache/bili`），两个目录都能从看板
+    素材包缓存在知识库内部时（`<库>/.workbuddy/cache/bili`），两个目录都能从进度
     运行目录上溯推出，因此不要求调用方每次都写路径。推出哪个用哪个，且一律打印出来。
     """
     cache = _first_dir(_candidate_caches(cache_dir))
@@ -112,7 +112,7 @@ def pack_paths(cache_dir, bv):
     归档目录与缓存目录同级（`cache/bili_subs`），与 `library_queue --finish` 的
     归档目标一致 —— 当成子目录会一条都对不上。
 
-    看板上的一行＝一支视频，多 P 视频的 id 是裸 BV 号，而素材包按页分文件
+    进度上的一行＝一支视频，多 P 视频的 id 是裸 BV 号，而素材包按页分文件
     （`bili_<BV>_p<页>.md`）。只认 `bili_<BV>.md` 会让多 P 视频被判成
     「素材包不存在」而永远补发不出完成信号（2026-10-03 实测：ck3 五分P 全部落空）。
     """
@@ -132,7 +132,7 @@ def pack_paths(cache_dir, bv):
 def note_for(bv, cache_dir, raw_dir):
     """返回 (纪要文件列表, 素材包列表, 跳过原因)。前两者只有一组非空。
 
-    多 P 视频要每一页都配到纪要才算写完：看板只有一行，只配上一页就补发完成，
+    多 P 视频要每一页都配到纪要才算写完：进度只有一行，只配上一页就补发完成，
     会把还没写纪要的页一起报成已完成。
     """
     packs = pack_paths(cache_dir, bv)
@@ -159,7 +159,7 @@ def note_for(bv, cache_dir, raw_dir):
 def _last_ts(d, bv, stage=None):
     """该任务最后一条事件的时刻；给了 stage 就只看该阶段。
 
-    事件里的任务名要按看板的口径归一（分P 后缀并到裸 BV），否则多 P 任务
+    事件里的任务名要按进度的口径归一（分P 后缀并到裸 BV），否则多 P 任务
     按裸 BV 查不到任何一条事件，已用时间就一直是空。
     """
     _run, events = ph._load_raw(d)
@@ -170,9 +170,9 @@ def _last_ts(d, bv, stage=None):
 
 
 def register_pending(name, d=None):
-    """登记一条「待编译」条目，让「纪要写完了、wiki 还没编译」在看板上可见。
+    """登记一条「待编译」条目，让「纪要写完了、wiki 还没编译」在进度上可见。
 
-    不加这一步，看板会显示成整批全部完成 —— 转写侧的「已完成」只表示纪要写完，
+    不加这一步，进度会显示成整批全部完成 —— 转写侧的「已完成」只表示纪要写完，
     编译是另一件事（用户 2026-10-02 的裁决）。
     """
     task = {'id': name, 'title': '编译 ' + name, 'up': 'wiki 编译',
@@ -188,7 +188,7 @@ def reconcile(d=None, raw_dir=None, cache_dir=None, dry=False, only=None,
     hint = cache_dir or os.environ.get('BILI_CACHE_DIR')
     run = resolve_run_dir(d, hint)
     if run is None:
-        return {'skipped': '找不到看板运行目录：设 BILI_PROGRESS_DIR，或用 --dir 指定'}
+        return {'skipped': '找不到进度运行目录：设 BILI_PROGRESS_DIR，或用 --dir 指定'}
     raw, cache = resolve_dirs(raw_dir, hint, run)
     if raw is None or cache is None:
         return {'error': '目录无法定位', 'run_dir': str(run),
@@ -222,7 +222,7 @@ def reconcile(d=None, raw_dir=None, cache_dir=None, dry=False, only=None,
                 task=bv, stage='done', pct=100.0, kind='end', elapsed=row['elapsed'],
                 duration_sec=t.get('duration_sec'),
                 note='已完成（依纪要文件自动补发）', d=run))
-            # 顺带把「待编译」挂上看板：这条只走到纪要，编译是另一件事
+            # 顺带把「待编译」挂上进度：这条只走到纪要，编译是另一件事
             if row['emitted'] and pend:
                 reg = []
                 for n in notes:
@@ -241,8 +241,8 @@ def reconcile(d=None, raw_dir=None, cache_dir=None, dry=False, only=None,
 
 
 def main():
-    ap = argparse.ArgumentParser(description='按纪要文件补发看板完成信号')
-    ap.add_argument('--dir', default=None, help='看板运行目录（默认 $BILI_PROGRESS_DIR）')
+    ap = argparse.ArgumentParser(description='按纪要文件补发进度完成信号')
+    ap.add_argument('--dir', default=None, help='进度运行目录（默认 $BILI_PROGRESS_DIR）')
     ap.add_argument('--raw-dir', default=None, help='纪要落盘目录（默认 $BILI_RAW_DIR）')
     ap.add_argument('--cache-dir', default=None, help='素材包目录（默认 $BILI_CACHE_DIR）')
     ap.add_argument('--dry-run', action='store_true', help='只列出会补哪些，不上报')

@@ -14,7 +14,7 @@
 
 **EN** — Turn a Bilibili video into a knowledge note you can still search six months later: official subtitles in seconds, or local dual-engine ASR (whisper ≈20× faster, Fun-ASR-Nano far better on Chinese proper nouns), then proper-noun correction + ad filtering, and finally a fixed 14-section Markdown entry that must pass structure and pack validation.
 
-[Releases](https://github.com/Willson-Huang/bilibili-video-summary/releases/latest) · [避坑经验](#避坑经验先看这个能省你几天) · [更新日志](#更新日志最新在上) · [为什么做这个](#为什么做这个) · [它是怎么工作的](#它是怎么工作的) · [进度看板](#进度看板mission-control) · [快速开始](#快速开始三选一) · [输出长什么样](#输出长什么样) · [真实输出示例](examples/2025-07-25_哲学知识分享——熵增与熵减_荣格不吃炸鸡_纪要.md) · [FAQ](#faq) · [隐私与数据流向](#隐私与数据流向) · [两个版本](#两个版本) · [升级与清理](#升级与清理) · [目录结构](#目录结构) · [注意事项](#注意事项)
+[Releases](https://github.com/Willson-Huang/bilibili-video-summary/releases/latest) · [避坑经验](#避坑经验先看这个能省你几天) · [更新日志](#更新日志最新在上) · [为什么做这个](#为什么做这个) · [它是怎么工作的](#它是怎么工作的) · [任务进度](#任务进度) · [快速开始](#快速开始三选一) · [输出长什么样](#输出长什么样) · [真实输出示例](examples/2025-07-25_哲学知识分享——熵增与熵减_荣格不吃炸鸡_纪要.md) · [FAQ](#faq) · [隐私与数据流向](#隐私与数据流向) · [两个版本](#两个版本) · [升级与清理](#升级与清理) · [目录结构](#目录结构) · [注意事项](#注意事项)
 
 </div>
 
@@ -51,7 +51,11 @@
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
-| **[v2.9.1](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.9.1)** | 2026-10-13 | 分P 视频全链路补齐（素材包按页归档与校验、按页配套补发完成信号）· 看板「闪一下就没了」与并发解析修复 |
+| **[v2.11.3](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.11.3)** | 2026-11-16 | 文档按专题拆分（主文件只留主流程与索引，细节移进 6 份专题文件）· 修五处会让人走错路的表述（入口顺序、子代理验收路径、校验日志落点、临时文件口径、参数表缺项）· 私有资源 ID 全部占位化 |
+| [v2.10.2](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.10.2) | 2026-10-14 | 随技能带进度窗口启动器（Windows / macOS / Linux，自动探测 Python 与进度目录）· 文档改以启动器为准 |
+| [v2.10.1](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.10.1) | 2026-10-14 | 进度可输出 JSON（给脚本与外部程序读）· 文档补上「每两秒重打一次」的系统自带做法 |
+| [v2.10.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.10.0) | 2026-10-14 | 移除浏览器进度界面（HTTP 服务、页面与启动脚本一并删除）· 进度只保留命令行 `--status` 查看 |
+| [v2.9.1](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.9.1) | 2026-10-13 | 分P 视频全链路补齐（素材包按页归档与校验、按页配套补发完成信号）· 看板「闪一下就没了」与并发解析修复 |
 | [v2.9.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.9.0) | 2026-10-13 | 命令行查看进度（一条命令打印，不起服务、不开浏览器）· 同一支视频不再在看板上裂成两行 |
 | [v2.8.0](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.8.0) | 2026-10-02 | 看板批次隔离（一个批次一个运行目录）· 未编译的看得见（新增「待编译」阶段 + 收尾信号自动对账）· 「已耗时」改回任务实测耗时 |
 | [v2.7.2](https://github.com/Willson-Huang/bilibili-video-summary/releases/tag/v2.7.2) | 2026-09-29 | 便携版凭据路径修正（导出的 Cookie 此前读不到）· 条目格式对齐知识库 · 文档精简 280 行 |
@@ -122,11 +126,9 @@ graph LR
 | **引擎路由** | 无字幕时按 `UP主白名单 → 视频 tag → 关键词打分` 选引擎（`--only-meta --classify` 给出建议）：`whisper` 快约 20 倍，`Fun-ASR-Nano` 中文专名更准（实测 10/11 对 2/11）；灰区一律判 whisper |
 | **纠错与校验** | `asr_glossary.txt` 强制纠正「看起来没毛病的合法中文词」类误识；纪要产出必须过 `verify_structure.py` 四项强制校验（frontmatter / tags·entities 数量 / 14 节齐全 / 要点表格化）；素材包在归档前还要过 `verify_pack.py` 五组校验，不合格就拒绝闭环 |
 
-## 进度看板（Mission Control）
+## 任务进度
 
-批量转写动辄几十分钟，这段时间看不到任何进展是最难熬的。v2.6.0 起内置一个零第三方依赖（stdlib only）的独立进度看板，不占用终端，也不会引入包依赖冲突：
-
-**只想看一眼进度**（v2.9.0 起）：一条命令打印到终端，不起服务、不开浏览器，读的是与看板同一份数据。
+批量转写动辄几十分钟，这段时间看不到任何进展是最难熬的。进度数据由转写脚本与收尾环节上报事件流，查看方式是一条命令打印到终端：
 
 ```bash
 python scripts/progress_hub.py --status
@@ -145,30 +147,25 @@ B站视频转录（funasr-nano）
   组 wiki编译       0.0%  0/1
 ```
 
-**要一直盯着进度**（批量任务跑几十分钟）用带界面的看板：
-
-![进度看板预览](docs/dashboard-preview.png)
+同一份内容也能以 JSON 形式输出，交给脚本或别的程序读：
 
 ```bash
-# 启动（写入端由管线自动上报，无需手动喂数据）
-python scripts/progress_hub.py --serve --port 8765 --dir <运行目录> --open
-# Windows 可一键启动
-scripts/bili_dashboard.bat [运行目录] [端口]
-# 想先看外观：生成演示数据
-python scripts/progress_hub.py --demo --dir <运行目录> && python scripts/progress_hub.py --serve --dir <运行目录> --open
+python scripts/progress_hub.py --json
 ```
+
+想连着盯屏幕就用随技能带的启动器，每两秒清屏重打一次：Windows 在项目目录里运行 `scripts\progress_watch.bat`（双击也行），macOS / Linux 运行 `./scripts/progress_watch.sh`。它会自己找到进度目录，也可以用 `progress_watch.bat <项目根>` 显式指定。
+
+（输出为演示数据，可用 `python scripts/progress_hub.py --demo --dir <运行目录>` 生成后先看外观。）
 
 | 设计要点 | 说明 |
 |---|---|
 | **每进程独立事件文件** | 各进程写自己的 `events_<pid>.jsonl`，**不抢锁、不会交错损坏**；进程崩溃只丢自己那一份 |
-| **两类任务同框** | 转写与纪要进度都进同一个看板，可按任务组区分来源 |
-| **失败看得见** | 失败计数、重试次数与事件流都在页面上，避免跑了一夜才发现有 3 条失败 |
-| **阶段与预计剩余** | 阶段按 `排队 → 下载 → 转码 → 转写 → 待生成纪要 → 生成纪要 → 已完成` 依次推进；预计剩余只按有实测依据的阶段给（倍率取「本批实测 → 批量兜底 2.1x → 单条常量」三档，顶部标出来源），没有样本的阶段显示「—」；数据龄按**最后一条事件**算，停更即转黄、转红 |
-| **独立窗口** | Windows 上叠加 `CREATE_BREAKAWAY_FROM_JOB` 逃出宿主 Job Object，流水线结束后看板仍存活 |
+| **两类任务同框** | 转写与纪要进度进同一份台账，可按任务组区分来源 |
+| **失败看得见** | 失败计数与事件流都能查，避免跑了一夜才发现有 3 条失败 |
+| **阶段与预计剩余** | 阶段按 `排队 → 下载 → 转码 → 转写 → 待生成纪要 → 生成纪要 → 已完成` 依次推进；预计剩余只按有实测依据的阶段给（倍率取「本批实测 → 批量兜底 2.1x → 单条常量」三档），没有样本的阶段显示「—」；数据龄按**最后一条事件**算，停更即提示 |
+| **百分比是估算** | Nano 一次处理整条音频、没有细粒度回调，单条百分比按「已用时间 ÷（音频时长 ÷ 倍率）」插值，上限截到 97%；阶段边界由脚本上报，这一段是精确的 |
 
-> ⚠️ 转写结束不再自动标记「已完成」：要让看板显示完整链路，需按所属版本的 SKILL.md（[便携版](./portable/SKILL.md) / [WorkBuddy 版](./workbuddy/SKILL.md)）在两个时点上报 —— 开始生成纪要发 `notes`，纪要写完发 `done`；不发则任务停在「待生成纪要」。
-
-> 上图为 `--demo` 生成的中性演示数据（非真实视频）。
+> ⚠️ 转写结束不再自动标记「已完成」：需按所属版本的 SKILL.md（[便携版](./portable/SKILL.md) / [WorkBuddy 版](./workbuddy/SKILL.md)）在两个时点上报 —— 开始生成纪要发 `notes`，纪要写完发 `done`；不发则任务停在「待生成纪要」。
 
 ## 前置条件
 
@@ -186,7 +183,6 @@ python scripts/progress_hub.py --demo --dir <运行目录> && python scripts/pro
 
 ```bash
 python portable/tests/test_core.py        # 纯 Python 自测
-node portable/tests/test_dashboard_times.js   # 看板前端回归（需要 Node）
 ```
 
 ## 快速开始（三选一）
@@ -247,7 +243,7 @@ python tests/test_core.py
 | | `--hf-mirror` · `--no-hf-mirror` | 模型下载走镜像（**默认开**）· 改回官方源 |
 | `process_queue.py` | `--init` · `--status` · `--limit N` · `--bvid BV号` | CSV 队列：初始化 · 看状态 · 限量 · 只处理指定条目 |
 | | `--retry-failed` · `--meta-only` | 重跑失败行 · 只补元信息 |
-| `progress_hub.py` | `--serve` · `--demo` · `--emit` | 起看板 · 生成演示数据 · 上报一条事件 |
+| `progress_hub.py` | `--status` · `--json` · `--demo` · `--emit` | 打印进度 · 输出 JSON · 生成演示数据 · 上报一条事件 |
 | | `--list-batches` · `--init --new-batch` | 列出已归档批次 · 开一批新运行（上一批自动归档） |
 | | `--compact` · `--reset` | 裁剪跨批次历史 · 清空运行目录 |
 
@@ -380,7 +376,7 @@ AI 平台看不到视频内容，只能基于标题、简介、评论猜。本�
 ## 升级与清理
 
 - **升级**：下载新版 zip 覆盖原目录即可；`workbuddy/` 的装法是整个文件夹替换 `~/.workbuddy/skills/bilibili-video-summary/`。导入到 AI 平台的 `SKILL.md` 需要**重新导入一次**（平台不会自动更新指令）。跨多个版本升级时先看 [Releases](https://github.com/Willson-Huang/bilibili-video-summary/releases) 里的升级提示。
-- **清理**：模型（约 1.5 GB）、音频临时文件与素材包归档都不在发布包里，升级时不受影响。它们的位置由 `BILI_MODEL_DIR` / `BILI_TMP` / `BILI_CACHE` 决定（默认在用户主目录下，见各版本 `SKILL.md` 的环境变量表），直接删目录即可，下次运行会重新下载模型。看板的运行目录用 `--reset` 清空事件与快照、`--compact` 裁剪跨批次历史。
+- **清理**：模型（约 1.5 GB）、音频临时文件与素材包归档都不在发布包里，升级时不受影响。它们的位置由 `BILI_MODEL_DIR` / `BILI_TMP` / `BILI_CACHE` 决定（默认在用户主目录下，见各版本 `SKILL.md` 的环境变量表），直接删目录即可，下次运行会重新下载模型。进度的运行目录用 `--reset` 清空事件与快照、`--compact` 裁剪跨批次历史。
 - **卸载**：删掉安装目录与上述缓存目录；已经写进知识库的笔记、以及 CSV 队列文件不受影响。
 
 ## 目录结构
@@ -408,7 +404,8 @@ bilibili-video-summary/
     │   ├── process_queue.py         本地 CSV 队列
     │   ├── search_bili.py           按关键词搜视频
     │   ├── bili.mjs · bili_wbi.py|mjs · set-cookie.mjs · bili.bat|sh   Node 侧入口、启动器与 WBI 签名
-    │   ├── progress_hub.py · dashboard.html · bili_dashboard.bat   进度看板
+    │   ├── progress_hub.py          任务进度上报与命令行查看
+    │   ├── progress_watch.bat|sh    进度窗口（每两秒刷新，自己找进度目录）
     │   ├── verify_structure.py      纪要结构校验（四项强制校验）
     │   ├── verify_pack.py           素材包校验（归档前拦截）
     │   ├── verify_coverage.py       增强前后覆盖比对
@@ -421,8 +418,8 @@ bilibili-video-summary/
     │   ├── 专名误识速查-主题组.txt           人工校对提示（只适合同主题视频）
     │   ├── engine_up_whitelist.txt · engine_verify_log.txt   引擎路由白名单（模板）
     │   ├── perf-benchmark-2026-09-13.md     引擎速度基准原始数据
-    │   └── progress-hub-design.md           看板设计与实现说明
-    └── tests/           # Python 自测 + 看板前端 JS 回归测试
+    │   └── progress-hub-design.md           任务进度设计与实现说明
+    └── tests/           # Python 自测
 ```
 
 ## 注意事项
